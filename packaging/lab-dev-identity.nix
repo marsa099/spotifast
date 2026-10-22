@@ -13,6 +13,7 @@
   substituteInPlace src/app.rs \
     --replace-fail 'fastframe_now_playing::App::new("spotifast", "Spotifast");' 'fastframe_now_playing::App::new("spotifast_lab", "Spotifast Lab"); app.desktop_entry = "spotifast-lab".into();' \
     --replace-fail 'id: "spotifast"' 'id: "spotifast-lab"' \
+    --replace-fail '"org.mpris.MediaPlayer2.spotifast"' '"org.mpris.MediaPlayer2.spotifast_lab"' \
     --replace-fail '"Spotifast"' '"Spotifast Lab"' \
     --replace-fail '{} - Spotifast' '{} - Spotifast Lab'
   substituteInPlace src/entrypoint.rs \
