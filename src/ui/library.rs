@@ -2,6 +2,7 @@
 
 use crate::api::models::{join_names, pick_image};
 use crate::app::App;
+use crate::i18n::gettext;
 use crate::model::{Action, Page};
 use crate::theme::{self, Icon};
 
@@ -10,25 +11,30 @@ use super::widgets;
 pub fn show(app: &mut App, ui: &mut egui::Ui, page: Page) {
     let palette = app.palette;
     ui.add_space(8.0);
+    let locale = app.locale;
     let (title, empty_title, empty_body) = match page {
-        Page::Albums => ("Albums", "No saved albums", "Saved albums appear here."),
+        Page::Albums => (
+            gettext(locale, "Albums"),
+            gettext(locale, "No saved albums"),
+            gettext(locale, "Saved albums appear here."),
+        ),
         Page::Artists => (
-            "Artists",
-            "No followed artists",
-            "Followed artists appear here.",
+            gettext(locale, "Artists"),
+            gettext(locale, "No followed artists"),
+            gettext(locale, "Followed artists appear here."),
         ),
         Page::Podcasts => (
-            "Podcasts",
-            "No podcasts yet",
-            "Followed podcasts appear here.",
+            gettext(locale, "Podcasts"),
+            gettext(locale, "No podcasts yet"),
+            gettext(locale, "Followed podcasts appear here."),
         ),
         _ => (
-            "Episodes",
-            "No saved episodes",
-            "Saved episodes appear here.",
+            gettext(locale, "Episodes"),
+            gettext(locale, "No saved episodes"),
+            gettext(locale, "Saved episodes appear here."),
         ),
     };
-    theme::text(ui, title, theme::bold(28.0), palette.text);
+    theme::text(ui, title.as_ref(), theme::bold(28.0), palette.text);
     ui.add_space(14.0);
     match page {
         Page::Albums => {
@@ -49,21 +55,27 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, page: Page) {
                 let id = album.id.clone();
                 let uri = album.uri.clone();
                 let subtitle = join_names(album.artists.iter().map(|artist| artist.name.as_str()));
+                let context_here = app.playing_context_uri().as_deref() == Some(uri.as_str());
+                let playing_here = context_here && app.believed_playing();
+                let card_art = app.art_px(widgets::CARD_ART);
                 let card = widgets::card(
                     ui,
                     app,
-                    pick_image(&album.images, 300),
+                    pick_image(&album.images, card_art),
                     &album.name,
                     &subtitle,
-                    false,
-                    true,
+                    widgets::CardCover::square(playing_here),
                 );
                 if card.play {
-                    app.actions.push(Action::PlayContext {
-                        uri,
-                        offset_uri: None,
-                        offset_index: None,
-                    });
+                    if context_here {
+                        app.actions.push(Action::TogglePlay);
+                    } else {
+                        app.actions.push(Action::PlayContext {
+                            uri,
+                            offset_uri: None,
+                            offset_index: None,
+                        });
+                    }
                 }
                 super::grid_navigation::virtual_card(
                     app,
@@ -94,8 +106,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, page: Page) {
                 error,
                 can_load,
                 empty,
-                empty_title,
-                empty_body,
+                &empty_title,
+                &empty_body,
                 Icon::Disc,
             );
         }
@@ -112,25 +124,32 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, page: Page) {
                     .collect();
                 super::grid_navigation::virtual_cards(app, ui, &pages, card_height);
             }
+            let artist_label = gettext(locale, "Artist");
             widgets::virtual_wrapped_cards(ui, count, card_height, |ui, index| {
                 let artist = app.library.artists.items[index].clone();
                 let id = artist.id.clone();
                 let uri = artist.uri.clone();
+                let context_here = app.playing_context_uri().as_deref() == Some(uri.as_str());
+                let playing_here = context_here && app.believed_playing();
+                let card_art = app.art_px(widgets::CARD_ART);
                 let card = widgets::card(
                     ui,
                     app,
-                    pick_image(&artist.images, 300),
+                    pick_image(&artist.images, card_art),
                     &artist.name,
-                    "Artist",
-                    true,
-                    true,
+                    &artist_label,
+                    widgets::CardCover::portrait(playing_here),
                 );
                 if card.play {
-                    app.actions.push(Action::PlayContext {
-                        uri,
-                        offset_uri: None,
-                        offset_index: None,
-                    });
+                    if context_here {
+                        app.actions.push(Action::TogglePlay);
+                    } else {
+                        app.actions.push(Action::PlayContext {
+                            uri,
+                            offset_uri: None,
+                            offset_index: None,
+                        });
+                    }
                 }
                 super::grid_navigation::virtual_card(
                     app,
@@ -163,8 +182,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, page: Page) {
                 error,
                 can_load,
                 empty,
-                empty_title,
-                empty_body,
+                &empty_title,
+                &empty_body,
                 Icon::Users,
             );
         }
@@ -184,14 +203,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, page: Page) {
             widgets::virtual_wrapped_cards(ui, count, card_height, |ui, index| {
                 let show = app.library.shows.items[index].show.clone();
                 let id = show.id.clone();
+                let card_art = app.art_px(widgets::CARD_ART);
                 let card = widgets::card(
                     ui,
                     app,
-                    pick_image(&show.images, 300),
+                    pick_image(&show.images, card_art),
                     &show.name,
                     &show.publisher,
-                    false,
-                    false,
+                    widgets::CardCover::default(),
                 );
                 super::grid_navigation::virtual_card(
                     app,
@@ -222,8 +241,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, page: Page) {
                 error,
                 can_load,
                 empty,
-                empty_title,
-                empty_body,
+                &empty_title,
+                &empty_body,
                 Icon::Mic,
             );
         }
@@ -258,8 +277,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, page: Page) {
                 error,
                 can_load,
                 empty,
-                empty_title,
-                empty_body,
+                &empty_title,
+                &empty_body,
                 Icon::Bookmark,
             );
         }
@@ -280,9 +299,22 @@ fn footer(
     icon: Icon,
 ) {
     let palette = app.palette;
+    if !app.network_reachable && empty {
+        widgets::empty_state(
+            ui,
+            &palette,
+            Icon::WifiOff,
+            &gettext(app.locale, "You're offline"),
+            &gettext(
+                app.locale,
+                "Spotifast will reconnect automatically when your connection returns.",
+            ),
+        );
+        return;
+    }
     if loading {
         ui.add_space(8.0);
-        widgets::loading_row(ui, &palette);
+        widgets::loading_row(ui, &palette, app.locale);
     }
     if let Some(error) = error {
         widgets::error_row(ui, app, &error, Some(page.clone()));

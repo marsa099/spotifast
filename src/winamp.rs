@@ -4,7 +4,7 @@
 //! skin is immediately available. `App::tick` keeps the loaded skin in sync
 //! with settings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -88,10 +88,10 @@ pub struct WinampState {
     marquee_text: String,
     marquee_offset: usize,
     marquee_moved: Option<Instant>,
-    /// Where the window opens, from the session or from where it last was.
-    pub restore_pos: Option<[f32; 2]>,
-    /// Where the window is, as last seen.
-    pub last_pos: Option<[f32; 2]>,
+    /// Where the window is, or was last: from the session, then followed
+    /// while it is open. Only the position is given to the next window,
+    /// which takes its size from the skin.
+    pub geometry: fastframe_shell::window::Geometry,
     /// The sound on its way out, for the visualiser.
     pub tap: Arc<AudioTap>,
     pub analyser: Analyser,
@@ -126,8 +126,10 @@ impl WinampState {
             marquee_text: String::new(),
             marquee_offset: 0,
             marquee_moved: None,
-            restore_pos,
-            last_pos: None,
+            geometry: fastframe_shell::window::Geometry {
+                position: restore_pos,
+                ..Default::default()
+            },
             tap,
             analyser: Analyser::default(),
             eq,
@@ -165,13 +167,6 @@ impl WinampState {
     pub fn forget_textures(&mut self) {
         self.textures.clear();
         self.playlist_text.clear();
-    }
-
-    /// Keeps where the window was, for the next time it opens.
-    pub fn remember_position(&mut self) {
-        if let Some(pos) = self.last_pos {
-            self.restore_pos = Some(pos);
-        }
     }
 
     /// The skin's sheets as textures, made now if they are not yet.
@@ -350,13 +345,47 @@ pub fn list_skins(folder: &Path) -> Vec<SkinChoice> {
     skins
 }
 
+/// Whether an unpacked skin has a main window bitmap, looked for the way
+/// [`Skin::from_dir`] reads one: in nested folders too, down to the same
+/// depth, without following links.
 fn has_main_bitmap(folder: &Path) -> bool {
-    std::fs::read_dir(folder).is_ok_and(|entries| {
-        entries.flatten().any(|entry| {
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            name == "main.bmp" || name == "main.png"
-        })
-    })
+    let mut folders = VecDeque::from([(folder.to_path_buf(), 0)]);
+    while let Some((folder, depth)) = folders.pop_front() {
+        let Ok(entries) = std::fs::read_dir(folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth < crate::skin::MAX_SKIN_DEPTH {
+                folders.push_back((entry.path(), depth + 1));
+            } else if kind.is_file() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if name == "main.bmp" || name == "main.png" {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// A skin other than `current`, at random, from `candidates` (`None` is the
+/// built-in skin). With nothing else to pick, `current` stays.
+pub fn pick_another(
+    candidates: &[Option<String>],
+    current: &Option<String>,
+    rng: &mut impl rand::Rng,
+) -> Option<String> {
+    let others: Vec<&Option<String>> = candidates
+        .iter()
+        .filter(|candidate| *candidate != current)
+        .collect();
+    if others.is_empty() {
+        return current.clone();
+    }
+    others[rng.random_range(0..others.len())].clone()
 }
 
 #[cfg(test)]
@@ -364,7 +393,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("fastpotify-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("spotifast-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -387,7 +416,7 @@ mod tests {
     fn a_short_title_sits_still_and_a_long_one_scrolls() {
         let mut state = WinampState::new(None, AudioTap::new(), crate::eq::shared());
         let start = Instant::now();
-        assert_eq!(state.marquee("Fastpotify", start).0, "Fastpotify");
+        assert_eq!(state.marquee("Spotifast", start).0, "Spotifast");
         assert!(!state.marquee_scrolling());
 
         let long = "Radiohead - Everything In Its Right Place (4:11)";
@@ -427,6 +456,26 @@ mod tests {
         assert_eq!(names, ["base.wsz", "Unpacked", "Zaxon.WSZ"]);
     }
 
+    /// A skin unpacked with its files a folder or more down, as Extract All
+    /// leaves an archive that keeps them in a folder, is listed: the reader
+    /// finds them there, down to the same depth.
+    #[test]
+    fn a_skin_unpacked_into_nested_folders_is_listed() {
+        let dir = temp_dir("nested-skins");
+        let inner = dir.join("Extracted").join("Some Skin");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("MAIN.BMP"), b"").unwrap();
+        let mut too_deep = dir.join("Too deep");
+        for _ in 0..=crate::skin::MAX_SKIN_DEPTH {
+            too_deep = too_deep.join("nested");
+        }
+        std::fs::create_dir_all(&too_deep).unwrap();
+        std::fs::write(too_deep.join("main.bmp"), b"").unwrap();
+        let names: Vec<String> = list_skins(&dir).into_iter().map(|skin| skin.name).collect();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(names, ["Extracted"]);
+    }
+
     #[test]
     fn labels_drop_the_archive_extension_only() {
         let choice = |name: &str| SkinChoice {
@@ -443,5 +492,26 @@ mod tests {
         assert!(list_skins(Path::new("/nonexistent/skins")).is_empty());
         assert!(is_skin_file(Path::new("/tmp/x.WSZ")));
         assert!(!is_skin_file(Path::new("/tmp/x.bmp")));
+    }
+
+    /// Random never repeats the skin it replaces, reaches every other one,
+    /// and keeps the only skin there is.
+    #[test]
+    fn a_random_skin_is_never_the_one_it_replaces() {
+        let candidates = [None, Some("A.wsz".to_owned()), Some("B".to_owned())];
+        let mut rng = rand::rng();
+        let current = Some("A.wsz".to_owned());
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let picked = pick_another(&candidates, &current, &mut rng);
+            assert_ne!(picked, current);
+            seen.insert(picked);
+        }
+        assert_eq!(seen.len(), 2, "both others are reachable");
+        assert_eq!(pick_another(&[None], &None, &mut rng), None);
+        assert_eq!(
+            pick_another(&[], &Some("gone".into()), &mut rng),
+            Some("gone".into())
+        );
     }
 }

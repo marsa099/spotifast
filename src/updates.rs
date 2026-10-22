@@ -1,74 +1,42 @@
-//! Daily update check against GitHub releases.
+//! Self-update from GitHub releases, through fastframe-update.
+//!
+//! The previous release's helper installs the first release built on the
+//! crate, so what it relies on stays the same: `--version` prints
+//! `<command> <version>`, the new app accepts `--update-receipt` and
+//! `--update-error` (stripped by [`fastframe_update::intercept`] before the
+//! argument parser), and the handoff and receipt files keep their format.
 
-use std::time::Duration;
+pub use fastframe_update::{
+    CHECK_INTERVAL, DownloadState, Installation, Kind, Prepared, Release, Source, Unsupported,
+    Updater,
+};
+use fastframe_update::{MacConfig, ReqwestTransport, UpdateConfig};
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
-
-const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/crmne/fastpotify/releases/latest";
-
-/// Update-check interval.
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Release {
-    /// The version number, without a leading `v`.
-    pub version: String,
-    /// The release page, with every download.
-    pub url: String,
-}
-
-#[derive(Deserialize)]
-struct LatestRelease {
-    tag_name: String,
-    html_url: String,
-}
-
-/// The newest release, when it is newer than this build.
-pub async fn newer_release(http: &reqwest::Client) -> Result<Option<Release>> {
-    let latest: LatestRelease = http
-        .get(LATEST_RELEASE_URL)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await
-        .context("unexpected release listing")?;
-    let version = latest.tag_name.trim_start_matches('v').to_string();
-    Ok(
-        is_newer(&version, env!("CARGO_PKG_VERSION")).then_some(Release {
-            version,
-            url: latest.html_url,
-        }),
+pub const CONFIG: UpdateConfig = UpdateConfig {
+    macos: MacConfig {
+        bundle_ids: &["rocks.spotifast.Spotifast"],
+        executable_names: &["Spotifast"],
+        legacy_bundle_names: &[],
+    },
+    // Releases publish an Ed25519 signature for checksums.txt. Require it
+    // before downloading an update, using the release workflow's public key.
+    publisher_key: Some(include_str!("../assets/update-public-key.hex")),
+    // Releases build their AppImages before publishing, so the signed
+    // checksums.txt lists them (#737): an AppImage replaces itself with the
+    // next one.
+    appimage: true,
+    ..UpdateConfig::new(
+        "crmne/spotifast",
+        "Spotifast",
+        "spotifast",
+        env!("CARGO_PKG_VERSION"),
     )
-}
+};
 
-/// `major.minor.patch`, and whether a `-rc1` or similar suffix marks it
-/// as a pre-release of that version; anything else is `None`.
-fn parse(version: &str) -> Option<([u64; 3], bool)> {
-    let version = version.trim();
-    let (numbers, pre_release) = match version.split_once('-') {
-        Some((numbers, _)) => (numbers, true),
-        None => (version, false),
-    };
-    let mut parts = numbers.split('.').map(|part| part.parse::<u64>().ok());
-    Some((
-        [parts.next()??, parts.next()??, parts.next()??],
-        pre_release,
-    ))
-}
-
-/// Whether `candidate` is a newer stable version than `current`.
-/// Stable releases supersede their release candidates. Other prereleases and
-/// invalid versions are ignored.
-pub fn is_newer(candidate: &str, current: &str) -> bool {
-    match (parse(candidate), parse(current)) {
-        (Some((candidate, false)), Some((current, current_pre))) => {
-            candidate > current || (candidate == current && current_pre)
-        }
-        _ => false,
-    }
+/// An updater on Spotifast's HTTP client, through the configured proxy.
+pub fn updater(proxy: &crate::settings::ProxyConfig) -> anyhow::Result<Updater> {
+    let builder = crate::http::blocking_builder(proxy).map_err(anyhow::Error::msg)?;
+    Ok(Updater::new(CONFIG, ReqwestTransport::new(builder)?))
 }
 
 #[cfg(test)]
@@ -76,23 +44,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn versions_compare_numerically() {
-        assert!(is_newer("0.1.4", "0.1.3"));
-        assert!(is_newer("0.2.0", "0.1.9"));
-        assert!(is_newer("1.0.0", "0.9.9"));
-        assert!(is_newer("0.1.10", "0.1.9"));
-        assert!(!is_newer("0.1.3", "0.1.3"));
-        assert!(!is_newer("0.1.2", "0.1.3"));
+    fn update_config_is_valid() {
+        CONFIG.validate().unwrap();
+        assert_eq!(CONFIG.current_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn updates_require_the_release_signing_key() {
         assert!(
-            !is_newer("0.2.0-rc1", "0.1.3"),
-            "pre-releases are not announced"
+            CONFIG.publisher_key.is_some(),
+            "updates must require a publisher signature"
         );
-        assert!(!is_newer("nightly", "0.1.3"));
-        // A release candidate hears about its release, and nothing older.
-        assert!(is_newer("0.4.0", "0.4.0-rc1"));
-        assert!(is_newer("0.4.1", "0.4.0-rc1"));
-        assert!(!is_newer("0.4.0-rc1", "0.4.0"));
-        assert!(!is_newer("0.4.0-rc2", "0.4.0-rc1"));
-        assert!(!is_newer("0.3.0", "0.4.0-rc1"));
+        CONFIG.validate().unwrap();
+    }
+
+    /// An AppImage may replace itself only because the release workflow
+    /// builds the AppImages into the signed checksums.txt;
+    /// packaging/test-release-names.py checks that side.
+    #[test]
+    fn appimages_update_themselves() {
+        const { assert!(CONFIG.appimage) };
     }
 }

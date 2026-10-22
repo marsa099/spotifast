@@ -7,13 +7,13 @@
 }:
 let
   pkgs = import fork.inputs.nixpkgs { inherit system; };
-  lab = import ./lab.nix { inherit system fork; };
+  labIdentity = import ./lab-dev-identity.nix;
   source = pkgs.runCommand "fastpotify-lab-dev-source" { } ''
     mkdir -p "$out"
     cp -R ${fork.outPath}/. "$out/"
     chmod -R u+w "$out"
     cd "$out"
-    ${lab.postPatch}
+    ${labIdentity}
   '';
   launch = pkgs.writeShellScriptBin "fastpotify-lab" ''
     data="''${XDG_DATA_HOME:-$HOME/.local/share}/fastpotify-lab-dev"
@@ -62,7 +62,7 @@ assert pkgs.stdenv.hostPlatform.isLinux;
       desktop
     ];
     postBuild = ''
-      install -Dm644 ${source}/packaging/icons/fastpotify.svg \
+      install -Dm644 ${source}/packaging/icons/spotifast.svg \
         "$out/share/icons/hicolor/scalable/apps/fastpotify-lab.svg"
     '';
     meta = {

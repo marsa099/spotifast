@@ -42,10 +42,61 @@ pub struct Page<T> {
 }
 
 impl<T> Page<T> {
+    /// A whole collection as one page, with nothing after it.
+    pub fn whole(items: Vec<T>) -> Self {
+        let count = u32::try_from(items.len()).unwrap_or(u32::MAX);
+        Self {
+            items,
+            total: count,
+            limit: count,
+            offset: 0,
+            next: None,
+        }
+    }
+
     pub fn next_offset(&self) -> Option<u32> {
         let consumed = self.limit.max(self.items.len() as u32);
         (self.next.is_some() && consumed > 0).then_some(self.offset + consumed)
     }
+}
+
+/// Positional track endpoints must retain null slots: dropping one changes
+/// every subsequent playback and edit offset. Other catalogue lists may skip them.
+#[derive(Deserialize)]
+#[serde(bound(deserialize = "T: Deserialize<'de>"))]
+pub(super) struct PositionedPage<T> {
+    #[serde(default)]
+    items: Vec<Option<T>>,
+    #[serde(default)]
+    total: u32,
+    #[serde(default)]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+    #[serde(default)]
+    next: Option<String>,
+}
+
+impl<T: Default> From<PositionedPage<T>> for Page<T> {
+    fn from(page: PositionedPage<T>) -> Self {
+        Self {
+            items: page
+                .items
+                .into_iter()
+                .map(Option::unwrap_or_default)
+                .collect(),
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+            next: page.next,
+        }
+    }
+}
+
+fn positioned_album_tracks<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Page<Track>>, D::Error> {
+    Ok(Option::<PositionedPage<Track>>::deserialize(deserializer)?.map(Into::into))
 }
 
 /// A cursor-paginated collection (followed artists, recently played).
@@ -78,6 +129,34 @@ pub struct Image {
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
+}
+
+/// The width of the smallest rendition Spotify serves: what rows, tiles and
+/// thumbnails ask for at one pixel per point.
+pub const SMALL_ART_WIDTH: u32 = 64;
+
+/// How many times the pixels it covers artwork is asked for at. It is scaled
+/// down on the CPU to what it covers before it reaches the GPU, and a little
+/// more than that hides the source's compression in the copy. Asking for
+/// twice took the 640 pixel rendition for a page header at 100%, when the
+/// 300 pixel one, the card's, has all the pixels it shows.
+const ART_OVERSAMPLE: f32 = 1.25;
+
+/// The pixel width to ask for, for art drawn `points` wide at
+/// `pixels_per_point`. Asking by points alone stretches a 64 pixel
+/// thumbnail over 90 pixels at 150% scaling, which shows as soft, blocky art.
+pub fn art_target(pixels_per_point: f32, points: f32) -> u32 {
+    let pixels = points * pixels_per_point;
+    let wanted = (pixels * ART_OVERSAMPLE).ceil().max(1.0);
+    // Spotify's smallest rendition loses fine detail to its compression,
+    // which shows unless it is drawn at half its size or less: a playlist's
+    // logo in a library row breaks up.
+    let wanted = if pixels * 2.0 > SMALL_ART_WIDTH as f32 {
+        wanted.max(SMALL_ART_WIDTH as f32 + 1.0)
+    } else {
+        wanted
+    };
+    wanted as u32
 }
 
 /// Picks the smallest image at least `target` pixels wide, or the largest.
@@ -181,7 +260,7 @@ pub struct Album {
     pub genres: Vec<String>,
     #[serde(default)]
     pub popularity: Option<u8>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "positioned_album_tracks")]
     pub tracks: Option<Page<Track>>,
     #[serde(default)]
     pub external_urls: ExternalUrls,
@@ -206,18 +285,23 @@ impl Album {
             .map(|date| date.get(..4).unwrap_or(date))
     }
 
-    pub fn kind_label(&self) -> &'static str {
+    pub fn kind_label(&self, locale: crate::i18n::Locale) -> std::borrow::Cow<'static, str> {
+        use crate::i18n::gettext;
         match self
             .album_group
             .as_deref()
             .or(self.album_type.as_deref())
             .unwrap_or("album")
         {
-            "single" => "Single",
-            "compilation" => "Compilation",
-            "appears_on" => "Appears On",
-            _ => "Album",
+            "single" => gettext(locale, "Single"),
+            "compilation" => gettext(locale, "Compilation"),
+            "appears_on" => gettext(locale, "Appears On"),
+            _ => gettext(locale, "Album"),
         }
+    }
+
+    pub(crate) fn is_single_release(&self) -> bool {
+        self.album_group.as_deref().or(self.album_type.as_deref()) == Some("single")
     }
 }
 
@@ -350,6 +434,25 @@ pub struct Episode {
     pub external_urls: ExternalUrls,
 }
 
+impl Episode {
+    /// Spotify's saved place in this episode when it was started and not
+    /// finished, kept a moment short of the end. A finished or unstarted
+    /// episode starts from the beginning.
+    pub fn resume_ms(&self) -> Option<u32> {
+        let resume = self.resume_point.as_ref()?;
+        if resume.fully_played || resume.resume_position_ms == 0 {
+            return None;
+        }
+        Some(if self.duration_ms > 0 {
+            resume
+                .resume_position_ms
+                .min(self.duration_ms.saturating_sub(1))
+        } else {
+            resume.resume_position_ms
+        })
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Show {
     #[serde(default)]
@@ -420,6 +523,10 @@ pub struct Playlist {
     pub tracks: Option<TrackCount>,
     #[serde(default, rename = "items")]
     pub items_count: Option<TrackCount>,
+    /// How many people saved the playlist. Only the Web API's playlist view
+    /// reports it; a header read over the streaming session carries none.
+    #[serde(default)]
+    pub followers: Option<Followers>,
     #[serde(default)]
     pub external_urls: ExternalUrls,
 }
@@ -432,8 +539,51 @@ impl Playlist {
             .map_or(0, |count| count.total)
     }
 
+    /// The owner as shown: the display name, else the id of anyone but
+    /// Spotify, whose lists carry no name over the streaming session.
+    /// Take from the library list's entry what this header lacks: the
+    /// streaming session's header carries no public flag, may leave the
+    /// owner unnamed, and has no picture for a playlist without a cover of
+    /// its own. What Spotify did say stays.
+    pub fn fill_from(&mut self, listed: &Playlist) {
+        if self.public.is_none() {
+            self.public = listed.public;
+        }
+        if self.owner.display_name.is_none() {
+            self.owner.display_name = listed.owner.display_name.clone();
+        }
+        if self.images.is_empty() {
+            self.images = listed.images.clone();
+        }
+    }
+
+    /// Take what a library entry listed blank lacks from the header the
+    /// streaming session read. Spotify's Web API lists some of its own
+    /// playlists, "This Is" ones among them, with no name, cover,
+    /// description or songs, though the session reads them whole. An entry
+    /// with a name is as Spotify listed it and stays.
+    pub fn fill_blank_from(&mut self, header: &Playlist) {
+        if !self.name.is_empty() {
+            return;
+        }
+        self.name = header.name.clone();
+        if self.images.is_empty() {
+            self.images = header.images.clone();
+        }
+        if self.description.as_deref().is_none_or(str::is_empty) {
+            self.description = header.description.clone();
+        }
+        if self.track_total() == 0 {
+            self.items_count = header.items_count.clone();
+        }
+    }
+
     pub fn owner_name(&self) -> &str {
-        self.owner.display_name.as_deref().unwrap_or("Spotify")
+        self.owner
+            .display_name
+            .as_deref()
+            .or_else(|| self.owner.id.as_deref().filter(|id| *id != "spotify"))
+            .unwrap_or("Spotify")
     }
 
     pub fn owned_by(&self, user_id: &str) -> bool {
@@ -772,12 +922,20 @@ mod tests {
         // `util::format_date` reads the same field with `get` and does not.
         assert_eq!(dated("\u{c791}\u{b144}").year(), Some("\u{c791}\u{b144}"));
         assert_eq!(
-            crate::util::format_date("\u{c791}\u{b144}"),
+            crate::util::format_date(crate::i18n::Locale::English, "\u{c791}\u{b144}"),
             "\u{c791}\u{b144}"
         );
         // No date at all is still no year.
         let json = r#"{"id":"a","name":"A","uri":"spotify:album:a"}"#;
         assert_eq!(serde_json::from_str::<Album>(json).unwrap().year(), None);
+    }
+
+    #[test]
+    fn album_tracks_keep_null_server_positions() {
+        let album: Album = serde_json::from_str(r#"{"tracks":{"items":[{"uri":"spotify:track:a"},null,{"uri":"spotify:track:c"}],"total":3,"limit":3}}"#).unwrap();
+        let tracks = album.tracks.unwrap();
+        assert_eq!(tracks.items.len(), 3);
+        assert_eq!(tracks.items[2].uri, "spotify:track:c");
     }
 
     #[test]
@@ -799,6 +957,78 @@ mod tests {
         assert_eq!(playlist.track_total(), 12);
         assert!(playlist.owned_by("me"));
         assert_eq!(playlist.owner_name(), "Me");
+        assert_eq!(playlist.followers, None);
+    }
+
+    /// The Web API's playlist view reports how many people saved it; a null
+    /// or missing count reads as none.
+    #[test]
+    fn playlist_followers_come_from_the_web_api_view() {
+        let json = r#"{"id":"p","followers":{"total":1845680}}"#;
+        let playlist: Playlist = serde_json::from_str(json).unwrap();
+        assert_eq!(playlist.followers.map(|f| f.total), Some(1_845_680));
+
+        let json = r#"{"id":"p","followers":null}"#;
+        let playlist: Playlist = serde_json::from_str(json).unwrap();
+        assert_eq!(playlist.followers, None);
+    }
+
+    /// An owner without a display name shows as the id, except Spotify,
+    /// whose lists carry no name over the streaming session.
+    /// A header takes from the library list only what it lacks.
+    #[test]
+    fn a_header_takes_from_the_list_only_what_it_lacks() {
+        let listed = Playlist {
+            public: Some(true),
+            owner: Owner {
+                id: Some("alice".into()),
+                display_name: Some("Alice".into()),
+                ..Default::default()
+            },
+            images: vec![Image {
+                url: "mosaic".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut bare = Playlist::default();
+        bare.fill_from(&listed);
+        assert_eq!(bare.public, Some(true));
+        assert_eq!(bare.owner.display_name.as_deref(), Some("Alice"));
+        assert_eq!(bare.images[0].url, "mosaic");
+
+        let mut told = Playlist {
+            public: Some(false),
+            owner: Owner {
+                display_name: Some("Spotify".into()),
+                ..Default::default()
+            },
+            images: vec![Image {
+                url: "cover".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        told.fill_from(&listed);
+        assert_eq!(told.public, Some(false));
+        assert_eq!(told.owner.display_name.as_deref(), Some("Spotify"));
+        assert_eq!(told.images[0].url, "cover");
+    }
+
+    #[test]
+    fn owner_name_falls_back_to_the_id_but_not_for_spotify() {
+        let named = |id: Option<&str>, name: Option<&str>| Playlist {
+            owner: Owner {
+                id: id.map(str::to_string),
+                display_name: name.map(str::to_string),
+                uri: None,
+            },
+            ..Playlist::default()
+        };
+        assert_eq!(named(Some("1263908142"), None).owner_name(), "1263908142");
+        assert_eq!(named(Some("1263908142"), Some("mgc")).owner_name(), "mgc");
+        assert_eq!(named(Some("spotify"), None).owner_name(), "Spotify");
+        assert_eq!(named(None, None).owner_name(), "Spotify");
     }
 
     #[test]
@@ -824,6 +1054,39 @@ mod tests {
         assert_eq!(pick_image(&images, 100), Some("medium"));
         assert_eq!(pick_image(&images, 1000), Some("large"));
         assert_eq!(pick_image(&[], 64), None);
+    }
+
+    /// Art is asked for at a quarter more than the pixels it covers, and
+    /// Spotify's blurry 64 pixel rendition only for covers of 32 pixels or
+    /// less: a 44 point row takes the 300 pixel one. A page header takes the
+    /// card's 300 pixel rendition at 100%, and the 640 from 125%; a card
+    /// keeps the 300 up to 150% and takes the 640 from 175%, the scaling
+    /// steps on either side of its switch at 163%.
+    #[test]
+    fn art_is_picked_for_the_display_pixels() {
+        let images = [640, 300, 64].map(|width| Image {
+            url: width.to_string(),
+            width: Some(width),
+            height: Some(width),
+        });
+        let pick = |pixels_per_point: f32, points: f32| {
+            pick_image(&images, art_target(pixels_per_point, points))
+        };
+        assert_eq!(pick(1.0, 24.0), Some("64"));
+        assert_eq!(pick(1.0, 32.0), Some("64"));
+        assert_eq!(pick(1.0, 33.0), Some("300"));
+        assert_eq!(pick(1.0, 44.0), Some("300"));
+        assert_eq!(pick(1.0, 148.0), Some("300"));
+        assert_eq!(pick(1.5, 148.0), Some("300"));
+        assert_eq!(pick(1.62, 148.0), Some("300"));
+        assert_eq!(pick(1.63, 148.0), Some("640"));
+        assert_eq!(pick(1.75, 148.0), Some("640"));
+        assert_eq!(pick(2.0, 148.0), Some("640"));
+        assert_eq!(pick(1.0, 212.0), Some("300"));
+        assert_eq!(pick(1.13, 212.0), Some("300"));
+        assert_eq!(pick(1.14, 212.0), Some("640"));
+        assert_eq!(pick(1.25, 212.0), Some("640"));
+        assert_eq!(art_target(1.25, 44.0), 69);
     }
 
     #[test]

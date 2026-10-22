@@ -123,7 +123,10 @@ impl GridNavigation {
                         Some(Action::PlayFromRow {
                             context: row.context.clone(),
                             uri: row.item.uri().to_string(),
-                            index: row.index as u32,
+                            index: match &row.context {
+                                crate::model::RowContext::Uris(uris) if uris.len() == 1 => 0,
+                                _ => row.index as u32,
+                            },
                         })
                     }
                     Command::Open => super::navigation::album(&row.item),

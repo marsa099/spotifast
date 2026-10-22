@@ -21,8 +21,8 @@ if [[ ${1:-} == --build-inside ]]; then
     # Demo support permits isolated screenshots; normal launches still use Spotify.
     cargo test --locked --lib --features demo
     cargo build --locked --features demo
-    binary="$CARGO_TARGET_DIR/debug/fastpotify"
-    for marker in rocks.fastpotify.Lab.Instance org.mpris.MediaPlayer2.fastpotify_lab fastpotify-lab; do
+    binary="$CARGO_TARGET_DIR/debug/spotifast"
+    for marker in fastpotify_lab fastpotify-lab 'Fastpotify Lab'; do
         if ! grep -aFq "$marker" "$binary"; then
             echo 'Refusing to deploy a binary without the Lab identities.' >&2
             exit 1
@@ -80,7 +80,7 @@ generation=$(mktemp -d "$data/generations/build.XXXXXXXX")
 # previous build's libraries when a later update changes the Nix inputs.
 nix develop "path:$source" --profile "$generation/environment" --command \
     bash "$(realpath "$0")" --build-inside "$cache" "$generation"
-printf 'source=%s\nbuilt=%s\n' "$source" "$(date -u +%FT%TZ)" > "$generation/build-info"
+printf 'repo=%s\nsource=%s\nbuilt=%s\n' "$repo" "$source" "$(date -u +%FT%TZ)" > "$generation/build-info"
 
 printf '[3/3] Selecting the tested build atomically\n'
 if [[ -L $data/current ]]; then

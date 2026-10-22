@@ -2,105 +2,34 @@
 
 use std::sync::Arc;
 
-use crate::api::models::{PlayableItem, pick_image};
+use crate::api::models::{Artist, PlayableItem, pick_image};
 use crate::app::App;
+use crate::i18n::{gettext, ngettext, pgettext};
 use crate::model::{Action, DiscographyFilter, Loadable, Page, RowContext};
 use crate::theme::{self, Icon};
 use crate::util;
 
-use super::collection::{Hero, hero};
+use super::collection::{Hero, HeroArt, hero, hero_images};
 use super::widgets::{self, TrackRow};
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
-    let Some(page) = app.artist_pages.remove(id) else {
+    if !app.artist_pages.contains_key(id) {
         app.ensure_loaded(Page::Artist(id.to_string()));
+    }
+    let Some(page) = app.artist_pages.remove(id) else {
         return;
     };
+    let preview =
+        super::loading_preview(ui.ctx(), id, &page.artist, || app.known_artist(id).cloned());
     let palette = app.palette;
+    let locale = app.locale;
     match &page.artist {
         Loadable::Loaded(artist) => {
-            let mut byline = Vec::new();
-            if let Some(followers) = &artist.followers {
-                byline.push((
-                    format!("{} followers", util::format_count(followers.total)),
-                    None,
-                ));
-            }
-            if !artist.genres.is_empty() {
-                byline.push((
-                    artist
-                        .genres
-                        .iter()
-                        .take(3)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    None,
-                ));
-            }
-            hero(
-                app,
-                ui,
-                Hero {
-                    image: pick_image(&artist.images, 300),
-                    liked: false,
-                    kind: "Artist",
-                    title: &artist.name,
-                    description: None,
-                    byline,
-                    round: true,
-                },
-            );
-            let following = app.is_saved(&artist.uri).unwrap_or(false);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 18.0;
-                if app.play_pending(&artist.uri) {
-                    theme::circle_spinner(ui, 56.0, palette.accent, palette.on_accent, "Starting…");
-                } else if theme::circle_button(
-                    ui,
-                    Icon::PlayFilled,
-                    56.0,
-                    palette.accent,
-                    palette.accent_hover,
-                    palette.on_accent,
-                    "Play",
-                )
-                .clicked()
-                {
-                    app.actions.push(Action::PlayContext {
-                        uri: artist.uri.clone(),
-                        offset_uri: None,
-                        offset_index: None,
-                    });
-                }
-                if theme::pill_button(
-                    ui,
-                    &palette,
-                    if following { "Following" } else { "Follow" },
-                    false,
-                )
-                .clicked()
-                {
-                    app.actions.push(Action::ToggleSaved(artist.uri.clone()));
-                }
-                let more = theme::icon_button(
-                    ui,
-                    Icon::Ellipsis,
-                    26.0,
-                    palette.secondary,
-                    palette.text,
-                    "More",
-                );
-                egui::Popup::menu(&more)
-                    .frame(widgets::menu_frame(&palette))
-                    .show(|ui| {
-                        widgets::context_menu_items(ui, app, &artist.uri, &artist.name, None)
-                    });
-            });
-            ui.add_space(20.0);
+            artist_hero(app, ui, artist, preview.as_deref());
+            artist_actions(app, ui, artist);
 
             // Popular.
-            theme::section_title(ui, &palette, "Popular");
+            theme::section_title(ui, &palette, &gettext(locale, "Popular"));
             ui.add_space(4.0);
             match &page.top_tracks {
                 Loadable::Loaded(tracks) if !tracks.is_empty() => {
@@ -113,6 +42,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     let items: Vec<PlayableItem> =
                         tracks.iter().cloned().map(PlayableItem::Track).collect();
                     let limit = if page.show_all_top { items.len() } else { 5 };
+                    app.request_play_counts(&artist.uri);
+                    let show_plays = app.has_play_counts(&artist.uri);
                     let owner = ui.id().with(("artist-popular", id));
                     let row_height = if app.settings.tracklist_compact {
                         theme::THIN_ROW_HEIGHT
@@ -127,36 +58,49 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                         &context,
                         row_height + ui.spacing().item_spacing.y,
                     );
-                    for (index, item) in items.iter().take(limit).enumerate() {
-                        let picked = widgets::track_row(
-                            ui,
-                            app,
-                            TrackRow {
-                                index,
-                                number: Some(index + 1),
-                                item,
-                                context: &context,
-                                show_cover: !app.settings.tracklist_compact,
-                                show_album: false,
-                                added_at: None,
-                                added_by: None,
-                                show_added_by: false,
-                                compact: false,
-                                thin: app.settings.tracklist_compact,
-                                shift: 0.0,
-                                picked: navigation.picked(index),
-                                picked_songs: &[],
-                            },
-                        );
-                        if picked.is_some() {
-                            super::navigation::pick(
+                    let render_top = |ui: &mut egui::Ui, app: &mut App| {
+                        for (index, item) in items.iter().take(limit).enumerate() {
+                            let picked = widgets::track_row(
+                                ui,
                                 app,
-                                super::navigation::Pane::Main,
-                                owner,
-                                index,
-                                egui::Id::new(item.uri()),
+                                TrackRow {
+                                    index,
+                                    number: Some(index + 1),
+                                    item,
+                                    context: &context,
+                                    show_cover: !app.settings.tracklist_compact,
+                                    show_album: false,
+                                    added_at: None,
+                                    added_by: None,
+                                    show_added_by: false,
+                                    show_plays,
+                                    compact: false,
+                                    thin: app.settings.tracklist_compact,
+                                    shift: 0.0,
+                                    picked: navigation.picked(index),
+                                    picked_songs: &[],
+                                    picked_positions: &[],
+                                    position: None,
+                                },
                             );
+                            if picked.is_some() {
+                                super::navigation::pick(
+                                    app,
+                                    super::navigation::Pane::Main,
+                                    owner,
+                                    index,
+                                    egui::Id::new(item.uri()),
+                                );
+                            }
                         }
+                    };
+                    if !app.network_reachable {
+                        ui.add_enabled_ui(false, |ui| {
+                            ui.multiply_opacity(0.55);
+                            render_top(ui, app);
+                        });
+                    } else {
+                        render_top(ui, app);
                     }
                     if items.len() > 5 {
                         ui.add_space(6.0);
@@ -164,10 +108,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                             ui,
                             &palette,
                             None,
-                            if page.show_all_top {
-                                "Show less"
+                            &if page.show_all_top {
+                                gettext(locale, "Show less")
                             } else {
-                                "See more"
+                                gettext(locale, "See more")
                             },
                             false,
                         )
@@ -178,9 +122,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     }
                 }
                 Loadable::Loaded(_) => {
-                    theme::subtle(ui, &palette, "No popular songs to show.");
+                    theme::subtle(ui, &palette, &gettext(locale, "No popular songs to show."));
                 }
-                Loadable::Loading | Loadable::NotLoaded => widgets::loading_row(ui, &palette),
+                Loadable::Loading | Loadable::NotLoaded => {
+                    widgets::skeleton_rows(ui, &palette, app.locale, 5)
+                }
                 Loadable::Failed(error) => {
                     let error = error.clone();
                     widgets::error_row(ui, app, &error, None);
@@ -189,11 +135,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
             ui.add_space(20.0);
 
             // Discography.
-            theme::section_title(ui, &palette, "Discography");
+            theme::section_title(ui, &palette, &gettext(locale, "Discography"));
             ui.add_space(6.0);
-            let options: Vec<(DiscographyFilter, &str)> = DiscographyFilter::ALL
+            let labels: Vec<_> = DiscographyFilter::ALL
                 .iter()
-                .map(|f| (*f, f.label()))
+                .map(|f| (*f, f.label(locale)))
+                .collect();
+            let options: Vec<(DiscographyFilter, &str)> = labels
+                .iter()
+                .map(|(filter, label)| (*filter, label.as_ref()))
                 .collect();
             if let Some(filter) = widgets::chips(ui, &palette, &options, page.filter) {
                 app.actions.push(Action::SetDiscographyFilter {
@@ -212,16 +162,22 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                         .collect();
                     widgets::grid(ui, |ui| {
                         for album in &albums {
-                            let subtitle =
-                                format!("{} • {}", album.year().unwrap_or(""), album.kind_label());
+                            let subtitle = format!(
+                                "{} • {}",
+                                album.year().unwrap_or(""),
+                                app.album_kind_label(album)
+                            );
+                            let context_here =
+                                app.playing_context_uri().as_deref() == Some(album.uri.as_str());
+                            let playing_here = context_here && app.believed_playing();
+                            let card_art = app.art_px(widgets::CARD_ART);
                             let card = widgets::card(
                                 ui,
                                 app,
-                                pick_image(&album.images, 300),
+                                pick_image(&album.images, card_art),
                                 &album.name,
                                 subtitle.trim_start_matches(" • "),
-                                false,
-                                true,
+                                widgets::CardCover::square(playing_here),
                             );
                             super::grid_navigation::card(
                                 app,
@@ -230,11 +186,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                                 Page::Album(album.id.clone()),
                             );
                             if card.play {
-                                app.actions.push(Action::PlayContext {
-                                    uri: album.uri.clone(),
-                                    offset_uri: None,
-                                    offset_index: None,
-                                });
+                                if context_here {
+                                    app.actions.push(Action::TogglePlay);
+                                } else {
+                                    app.actions.push(Action::PlayContext {
+                                        uri: album.uri.clone(),
+                                        offset_uri: None,
+                                        offset_index: None,
+                                    });
+                                }
                             }
                             if card.clicked {
                                 app.actions
@@ -255,21 +215,31 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                         }
                     });
                     if list.loading {
-                        widgets::loading_row(ui, &palette);
+                        widgets::loading_row(ui, &palette, app.locale);
                     } else if let Some(error) = &list.error {
                         let error = error.clone();
                         widgets::error_row(ui, app, &error, None);
                     } else if list.items.is_empty() {
-                        theme::subtle(ui, &palette, "Nothing in this category.");
+                        theme::subtle(ui, &palette, &gettext(locale, "Nothing in this category."));
                     } else if list.can_load_more() {
                         ui.add_space(8.0);
-                        if theme::soft_button(ui, &palette, None, "Load more", false).clicked() {
+                        if theme::soft_button(
+                            ui,
+                            &palette,
+                            None,
+                            &gettext(locale, "Load more"),
+                            false,
+                        )
+                        .clicked()
+                        {
                             app.actions
                                 .push(Action::LoadMoreArtistAlbums(id.to_string()));
                         }
                     }
                 }
-                None => widgets::loading_row(ui, &palette),
+                None => widgets::grid(ui, |ui| {
+                    widgets::skeleton_cards(ui, &palette, app.locale, 6, false)
+                }),
             }
             ui.add_space(20.0);
 
@@ -277,16 +247,21 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
             if let Loadable::Loaded(related) = &page.related
                 && !related.is_empty()
             {
-                widgets::shelf(ui, &palette, "related", "Fans also like", |ui| {
+                let artist_label = gettext(locale, "Artist");
+                let title = gettext(locale, "Fans also like");
+                widgets::shelf(ui, &palette, "related", &title, |ui| {
                     for artist in related {
+                        let context_here =
+                            app.playing_context_uri().as_deref() == Some(artist.uri.as_str());
+                        let playing_here = context_here && app.believed_playing();
+                        let card_art = app.art_px(widgets::CARD_ART);
                         let card = widgets::card(
                             ui,
                             app,
-                            pick_image(&artist.images, 300),
+                            pick_image(&artist.images, card_art),
                             &artist.name,
-                            "Artist",
-                            true,
-                            true,
+                            &artist_label,
+                            widgets::CardCover::portrait(playing_here),
                         );
                         super::grid_navigation::card(
                             app,
@@ -295,11 +270,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                             Page::Artist(artist.id.clone()),
                         );
                         if card.play {
-                            app.actions.push(Action::PlayContext {
-                                uri: artist.uri.clone(),
-                                offset_uri: None,
-                                offset_index: None,
-                            });
+                            if context_here {
+                                app.actions.push(Action::TogglePlay);
+                            } else {
+                                app.actions.push(Action::PlayContext {
+                                    uri: artist.uri.clone(),
+                                    offset_uri: None,
+                                    offset_index: None,
+                                });
+                            }
                         }
                         if card.clicked {
                             app.actions
@@ -322,14 +301,167 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
             }
         }
         Loadable::Loading | Loadable::NotLoaded => {
-            ui.add_space(40.0);
-            widgets::loading_row(ui, &palette);
+            if let Some(artist) = &preview {
+                artist_hero(app, ui, artist, None);
+            } else {
+                ui.add_space(40.0);
+            }
+            if !app.network_reachable {
+                widgets::empty_state(
+                    ui,
+                    &palette,
+                    Icon::WifiOff,
+                    &gettext(app.locale, "You're offline"),
+                    &gettext(
+                        app.locale,
+                        "Spotifast will reconnect automatically when your connection returns.",
+                    ),
+                );
+            } else {
+                if let Some(artist) = &preview {
+                    ui.add_enabled_ui(false, |ui| artist_actions(app, ui, artist));
+                }
+                widgets::skeleton_rows(ui, &palette, app.locale, 5);
+            }
         }
         Loadable::Failed(error) => {
             let error = error.clone();
-            ui.add_space(40.0);
-            widgets::error_row(ui, app, &error, Some(Page::Artist(id.to_string())));
+            if let Some(artist) = &preview {
+                artist_hero(app, ui, artist, None);
+            } else {
+                ui.add_space(40.0);
+            }
+            if !app.network_reachable
+                || error.contains("network error")
+                || error.contains("Network connection error")
+            {
+                widgets::empty_state(
+                    ui,
+                    &palette,
+                    Icon::WifiOff,
+                    &gettext(app.locale, "You're offline"),
+                    &gettext(
+                        app.locale,
+                        "Spotifast will reconnect automatically when your connection returns.",
+                    ),
+                );
+            } else {
+                if let Some(artist) = &preview {
+                    ui.add_enabled_ui(false, |ui| artist_actions(app, ui, artist));
+                }
+                widgets::error_row(ui, app, &error, Some(Page::Artist(id.to_string())));
+            }
         }
     }
     app.artist_pages.insert(id.to_string(), page);
+}
+
+fn artist_hero(app: &mut App, ui: &mut egui::Ui, artist: &Artist, preview: Option<&Artist>) {
+    let locale = app.locale;
+    let mut byline = Vec::new();
+    if let Some(followers) = &artist.followers {
+        byline.push((
+            ngettext(
+                locale,
+                // Translators: {count} is the number of people who follow an artist.
+                "{count} follower",
+                "{count} followers",
+                u32::try_from(followers.total).unwrap_or(u32::MAX),
+            )
+            .replace("{count}", &util::format_count(followers.total)),
+            None,
+        ));
+    }
+    if !artist.genres.is_empty() {
+        byline.push((
+            artist
+                .genres
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            None,
+        ));
+    }
+    let images = hero_images(
+        &artist.images,
+        preview.map(|artist| artist.images.as_slice()),
+        false,
+        HeroArt::of(app),
+    );
+    hero(
+        app,
+        ui,
+        Hero {
+            images,
+            liked: false,
+            kind: gettext(locale, "Artist"),
+            title: &artist.name,
+            description: None,
+            byline,
+            avatar: None,
+            round: true,
+        },
+    );
+}
+
+fn artist_actions(app: &mut App, ui: &mut egui::Ui, artist: &Artist) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let following = app.is_saved(&artist.uri).unwrap_or(false);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 18.0;
+        if app.play_pending(&artist.uri) {
+            theme::circle_spinner(
+                ui,
+                56.0,
+                palette.accent,
+                palette.on_accent,
+                &gettext(locale, "Starting…"),
+            );
+        } else if theme::circle_button(
+            ui,
+            Icon::PlayFilled,
+            56.0,
+            palette.accent,
+            palette.accent_hover,
+            palette.on_accent,
+            &gettext(locale, "Play"),
+        )
+        .clicked()
+        {
+            app.actions.push(Action::PlayContext {
+                uri: artist.uri.clone(),
+                offset_uri: None,
+                offset_index: None,
+            });
+        }
+        if theme::pill_button(
+            ui,
+            &palette,
+            &if following {
+                pgettext(locale, "artist", "Following")
+            } else {
+                pgettext(locale, "artist", "Follow")
+            },
+            false,
+        )
+        .clicked()
+        {
+            app.actions.push(Action::ToggleSaved(artist.uri.clone()));
+        }
+        let more = theme::icon_button(
+            ui,
+            Icon::Ellipsis,
+            26.0,
+            palette.secondary,
+            palette.text,
+            &gettext(locale, "More"),
+        );
+        egui::Popup::menu(&more)
+            .frame(widgets::menu_frame(&palette))
+            .show(|ui| widgets::context_menu_items(ui, app, &artist.uri, &artist.name, None));
+    });
+    ui.add_space(20.0);
 }

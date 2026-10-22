@@ -17,6 +17,7 @@ use librespot_connect::{
     Spirc,
 };
 use librespot_core::{
+    SpotifyUri,
     authentication::Credentials,
     cache::Cache,
     config::{DeviceType, SessionConfig},
@@ -24,7 +25,11 @@ use librespot_core::{
     session::Session,
     spotify_id::SpotifyId,
 };
-use librespot_metadata::audio::{AudioItem, UniqueFields};
+use librespot_metadata::{
+    Album as MetadataAlbum, Metadata,
+    album::AlbumType,
+    audio::{AudioItem, UniqueFields},
+};
 use librespot_playback::{
     audio_backend::{self, Sink},
     config::{AudioFormat, Bitrate, NormalisationType, PlayerConfig, VolumeCtrl},
@@ -55,6 +60,10 @@ pub struct EngineConfig {
     pub tap: Arc<AudioTap>,
     /// The equalizer's settings, shared with the window that sets them.
     pub eq: crate::eq::SharedEq,
+    /// Proxy used by the Web API client. Librespot only uses the HTTP form.
+    pub proxy: crate::settings::ProxyConfig,
+    /// The folder a playlist's `spotify:local:` songs play from.
+    pub local_files: Option<PathBuf>,
 }
 
 impl EngineConfig {
@@ -172,6 +181,17 @@ pub struct LocalState {
     pub active_client: String,
     pub error: Option<String>,
     pub seek_sequence: u64,
+    /// The engine is fetching a track right now, even when the previous
+    /// track's `playback` still reads `Playing` so its controls stay visible
+    /// through the swap.
+    pub loading: bool,
+    /// A newly loaded track, including another play of the same URI.
+    pub track_sequence: u64,
+    /// Another play of the same track started, and its start position has
+    /// not arrived yet. The track looks unchanged, so the `Playing` or
+    /// `Paused` that brings the position counts as a seek for media
+    /// controls, which would otherwise count on past the end (#587).
+    pub replay_pending: bool,
 }
 
 /// What local playback was doing when its session ended, so the engine
@@ -227,9 +247,35 @@ pub struct LoadSpec {
     pub position_ms: u32,
     pub play: bool,
     pub shuffle: Option<bool>,
+    /// Explicit repeat preference for a new load. Otherwise retain the
+    /// engine's current preference instead of librespot's default (off).
+    pub repeat: Option<RepeatMode>,
     /// Play what Spotify would follow `context_uri` with, its autoplay
     /// station, rather than the context itself.
     pub autoplay: bool,
+}
+
+/// A dropped Connect session retains its complete playback state. Live
+/// replacement for an audio-settings change still uses a track pickup.
+#[derive(Clone, Debug)]
+pub enum PlaybackResume {
+    Session(Arc<librespot_connect::PlaybackSnapshot>),
+    Track(LoadSpec),
+}
+
+impl LoadSpec {
+    fn context_options(&self, current_repeat: RepeatMode) -> LoadContextOptions {
+        if self.autoplay {
+            LoadContextOptions::Autoplay
+        } else {
+            let repeat = self.repeat.unwrap_or(current_repeat);
+            LoadContextOptions::Options(Options {
+                shuffle: self.shuffle.unwrap_or(false),
+                repeat: repeat == RepeatMode::Context,
+                repeat_track: repeat == RepeatMode::Track,
+            })
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -251,7 +297,8 @@ pub enum PlayerCommand {
     Shuffle(bool),
     Repeat(RepeatMode),
     Load(LoadSpec),
-    Activate,
+    /// Take over the active Connect session, including its queue and position.
+    Transfer,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -261,6 +308,65 @@ pub enum EngineEvent {
 }
 
 pub type Notify = Arc<dyn Fn(EngineEvent) + Send + Sync>;
+
+/// The parts of an engine that outlive its session (#268). librespot's
+/// player keeps playing what it has already fetched when the session drops;
+/// handed to the next engine, the song carries on through the reconnect
+/// instead of stopping until the new session has loaded it again.
+#[derive(Clone)]
+pub struct KeptPlayer {
+    player: Arc<Player>,
+    mixer: Arc<dyn Mixer>,
+    state: Arc<Mutex<LocalState>>,
+    audio: Arc<AudioControl>,
+}
+
+impl KeptPlayer {
+    /// Stops the song, when nothing is going to pick it up.
+    pub fn stop(&self) {
+        self.player.stop();
+    }
+
+    /// Pauses the song or plays it again, while there is no session to ask.
+    /// False when it has no song left to pause or play.
+    pub fn toggle(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.track.is_none() {
+            return false;
+        }
+        // Shown at once, and a second toggle before the player answers
+        // undoes the first instead of repeating it.
+        match state.playback {
+            Playback::Playing => {
+                state.position_ms = state.position_now();
+                state.position_at = None;
+                state.playback = Playback::Paused;
+                self.player.pause();
+            }
+            Playback::Paused => {
+                state.position_at = Some(Instant::now());
+                state.playback = Playback::Playing;
+                self.player.play();
+            }
+            Playback::Stopped | Playback::Loading => return false,
+        }
+        true
+    }
+
+    /// Whether the player still has a song, playing or paused.
+    pub fn has_song(&self) -> bool {
+        self.now().is_some()
+    }
+
+    /// Where the song is now and whether it plays, or `None` once the
+    /// player has nothing left.
+    fn now(&self) -> Option<Interrupted> {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .interrupted()
+    }
+}
 
 pub struct Engine {
     player: Arc<Player>,
@@ -272,7 +378,12 @@ pub struct Engine {
     /// What was playing when the session ended on its own.
     interrupted: Arc<Mutex<Option<Interrupted>>>,
     shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// The session is being ended while its player plays on.
+    closing: Arc<std::sync::atomic::AtomicBool>,
     audio: Arc<AudioControl>,
+    /// The player came from a dropped session and still plays what that
+    /// session left it, until something is loaded through this one.
+    carrying: std::sync::atomic::AtomicBool,
 }
 
 impl Engine {
@@ -280,18 +391,113 @@ impl Engine {
         self.session.cache().and_then(|cache| cache.credentials())
     }
     /// Connects to Spotify and announces this device on Spotify Connect.
+    /// A player `kept` from an engine whose session dropped plays on, and
+    /// this engine takes it over, instead of starting a player of its own.
     pub async fn connect(
         config: &EngineConfig,
+        proxy: Option<reqwest::Url>,
         credentials: Credentials,
         cache: Cache,
         notify: Notify,
+        kept: Option<KeptPlayer>,
     ) -> Result<Self> {
-        let device_id = config.device_id();
         let session_config = SessionConfig {
-            device_id: device_id.clone(),
+            device_id: config.device_id(),
             autoplay: Some(config.autoplay),
+            proxy,
             ..SessionConfig::default()
         };
+        let session = Session::new(session_config, Some(cache));
+        let carrying = kept.is_some();
+        let (player, mixer, state, audio) = match kept {
+            Some(kept) => (kept.player, kept.mixer, kept.state, kept.audio),
+            None => Self::start_player(config, &session, &notify)?,
+        };
+
+        let connect_config = ConnectConfig {
+            name: config.device_name.clone(),
+            device_type: DeviceType::Computer,
+            initial_volume: config.initial_volume,
+            disable_volume: false,
+            volume_steps: 64,
+            ..ConnectConfig::default()
+        };
+        let (spirc, spirc_task) = Spirc::new(
+            connect_config,
+            session.clone(),
+            credentials,
+            Arc::clone(&player),
+            Arc::clone(&mixer),
+        )
+        .await
+        .context("unable to connect to Spotify")?;
+        if carrying {
+            // Before Spirc's task runs, so everything it loads comes through
+            // the new session. The song already playing keeps fetching the
+            // rest of its file as it did.
+            player.set_session(session.clone());
+        }
+
+        {
+            let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
+            current.connected = true;
+            current.username = session.username();
+            notify(EngineEvent::State(current.clone()));
+        }
+
+        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interrupted: Arc<Mutex<Option<Interrupted>>> = Arc::default();
+        let ended_flag = Arc::clone(&shutting_down);
+        let ended_closing = Arc::clone(&closing);
+        let ended_notify = Arc::clone(&notify);
+        let ended_state = Arc::clone(&state);
+        let ended_interrupted = Arc::clone(&interrupted);
+        tokio::spawn(async move {
+            spirc_task.await;
+            let shut_down = ended_flag.load(std::sync::atomic::Ordering::SeqCst);
+            {
+                let mut current = ended_state.lock().unwrap_or_else(|p| p.into_inner());
+                // Kept before the state is marked stopped, so a reconnect
+                // knows what to pick up.
+                *ended_interrupted.lock().unwrap_or_else(|p| p.into_inner()) =
+                    current.interrupted();
+                session_ended(&mut current, shut_down);
+                ended_notify(EngineEvent::State(current.clone()));
+            }
+            if !shut_down && !ended_closing.load(std::sync::atomic::Ordering::SeqCst) {
+                ended_notify(EngineEvent::SessionEnded);
+            }
+        });
+
+        let device_id = config.device_id();
+        Ok(Self {
+            player,
+            spirc: Arc::new(spirc),
+            session,
+            mixer,
+            device_id,
+            state,
+            interrupted,
+            shutting_down,
+            closing,
+            audio,
+            carrying: std::sync::atomic::AtomicBool::new(carrying),
+        })
+    }
+
+    /// A new player, with the mixer, output and state it plays through.
+    #[allow(clippy::type_complexity)]
+    fn start_player(
+        config: &EngineConfig,
+        session: &Session,
+        notify: &Notify,
+    ) -> Result<(
+        Arc<Player>,
+        Arc<dyn Mixer>,
+        Arc<Mutex<LocalState>>,
+        Arc<AudioControl>,
+    )> {
         let normalisation_factor = Arc::new(std::sync::atomic::AtomicU64::new(1.0f64.to_bits()));
         let player_config = PlayerConfig {
             bitrate: config.bitrate(),
@@ -303,6 +509,9 @@ impl Engine {
             // the tap can undo it for the visualisers: they show the music,
             // not the loudness housekeeping.
             normalisation_report: Some(Arc::clone(&normalisation_factor)),
+            // librespot reads this folder's tags on its own player thread
+            // when the engine starts, never on the UI thread.
+            local_file_directories: config.local_files.iter().cloned().collect(),
             ..PlayerConfig::default()
         };
 
@@ -322,12 +531,11 @@ impl Engine {
             volume: config.initial_volume,
             ..LocalState::default()
         }));
-        let session = Session::new(session_config, Some(cache));
         let audio = AudioControl::new(config.buffer_ms);
         let (sink_builder, volume) = sink_builder(
             config,
             Arc::clone(&state),
-            Arc::clone(&notify),
+            Arc::clone(notify),
             &mixer,
             Arc::clone(&normalisation_factor),
             Arc::clone(&audio),
@@ -337,70 +545,33 @@ impl Engine {
         tokio::spawn(run_events(
             events,
             Arc::clone(&state),
-            Arc::clone(&notify),
+            Arc::clone(notify),
             Arc::clone(&audio),
         ));
+        Ok((player, mixer, state, audio))
+    }
 
-        let connect_config = ConnectConfig {
-            name: config.device_name.clone(),
-            device_type: DeviceType::Computer,
-            initial_volume: config.initial_volume,
-            disable_volume: false,
-            volume_steps: 64,
-            ..ConnectConfig::default()
-        };
-        let (spirc, spirc_task) = Spirc::new(
-            connect_config,
-            session.clone(),
-            credentials,
-            Arc::clone(&player),
-            Arc::clone(&mixer),
-        )
-        .await
-        .context("unable to connect to Spotify")?;
-
-        {
-            let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
-            current.connected = true;
-            current.username = session.username();
-            notify(EngineEvent::State(current.clone()));
+    /// The player and what it plays through, for the engine that replaces
+    /// this one after its session dropped. Nothing stops it: the song plays
+    /// on until the next engine takes it over or [`KeptPlayer::stop`].
+    pub fn keep_player(&self) -> KeptPlayer {
+        KeptPlayer {
+            player: Arc::clone(&self.player),
+            mixer: Arc::clone(&self.mixer),
+            state: Arc::clone(&self.state),
+            audio: Arc::clone(&self.audio),
         }
+    }
 
-        let shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let interrupted: Arc<Mutex<Option<Interrupted>>> = Arc::default();
-        let ended_flag = Arc::clone(&shutting_down);
-        let ended_notify = Arc::clone(&notify);
-        let ended_state = Arc::clone(&state);
-        let ended_interrupted = Arc::clone(&interrupted);
-        tokio::spawn(async move {
-            spirc_task.await;
-            {
-                let mut current = ended_state.lock().unwrap_or_else(|p| p.into_inner());
-                // Kept before the state is marked stopped, so a reconnect
-                // knows what to pick up.
-                *ended_interrupted.lock().unwrap_or_else(|p| p.into_inner()) =
-                    current.interrupted();
-                current.connected = false;
-                current.playback = Playback::Stopped;
-                current.position_at = None;
-                ended_notify(EngineEvent::State(current.clone()));
-            }
-            if !ended_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                ended_notify(EngineEvent::SessionEnded);
-            }
-        });
+    /// Whether the player still plays only what a dropped session left it:
+    /// nothing has been loaded or picked up through this engine yet.
+    pub fn carrying(&self) -> bool {
+        self.carrying.load(std::sync::atomic::Ordering::SeqCst)
+    }
 
-        Ok(Self {
-            player,
-            spirc: Arc::new(spirc),
-            session,
-            mixer,
-            device_id,
-            state,
-            interrupted,
-            shutting_down,
-            audio,
-        })
+    fn stop_carrying(&self) {
+        self.carrying
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Playback state to resume after replacing this engine.
@@ -420,6 +591,35 @@ impl Engine {
 
     pub fn device_id(&self) -> &str {
         &self.device_id
+    }
+
+    /// What this engine is heard at, kept past the engine itself: the next
+    /// engine starts there.
+    pub(crate) fn heard(&self) -> Heard {
+        Heard {
+            state: Arc::clone(&self.state),
+        }
+    }
+
+    /// Applies a level set here to the mixer and the state at once, so the
+    /// engine is heard at it from now on. Connect is told on release, not
+    /// while the slider is still moving.
+    fn note_volume(&self, volume: u16, preview: bool) -> Result<()> {
+        self.mixer.set_volume(volume);
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).volume = volume;
+        if !preview {
+            self.spirc.set_volume(volume)?;
+        }
+        Ok(())
+    }
+
+    /// Whether Spotify classifies this album as an EP in its internal metadata.
+    pub(crate) async fn album_is_ep(&self, album_uri: &str) -> Result<bool> {
+        let uri = SpotifyUri::from_uri(album_uri).context("invalid album URI")?;
+        let album = MetadataAlbum::get(&self.session, &uri)
+            .await
+            .context("album metadata")?;
+        Ok(album.album_type == AlbumType::EP)
     }
 
     /// Spotify's own transcription of a track, as the raw JSON its clients
@@ -442,32 +642,11 @@ impl Engine {
     /// Account playlist tree in Spotify order, including folder markers,
     /// and which of its playlists the account may add songs to.
     pub async fn rootlist(&self) -> Result<Rootlist> {
-        use protobuf::Message as _;
         let mut uris = Vec::new();
         let mut editable = std::collections::BTreeSet::new();
-        let mut from = 0usize;
-        loop {
-            let bytes = self
-                .session
-                .spclient()
-                .get_rootlist(from, Some(500))
-                .await
-                .map_err(|error| anyhow!("rootlist: {error}"))?;
-            let content =
-                librespot_protocol::playlist4_external::SelectedListContent::parse_from_bytes(
-                    &bytes,
-                )?;
-            let Some(contents) = content.contents.into_option() else {
-                break;
-            };
-            let count = contents.items.len();
-            let truncated = contents.truncated();
+        for contents in crate::session_reads::rootlist(&self.session).await? {
             editable.extend(editable_uris(&contents));
             uris.extend(contents.items.into_iter().filter_map(|item| item.uri));
-            if !truncated || count == 0 {
-                break;
-            }
-            from += count;
         }
         Ok(Rootlist {
             entries: parse_rootlist(&uris),
@@ -475,19 +654,9 @@ impl Engine {
         })
     }
 
-    /// The display name behind a user id, from the profile view Spotify's
-    /// clients read; `None` when nothing answers.
-    pub async fn user_display_name(&self, user_id: &str) -> Option<String> {
-        let bytes = self
-            .session
-            .spclient()
-            .get_user_profile(user_id, Some(0), Some(0))
-            .await
-            .ok()?;
-        let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-        json.get("name")
-            .and_then(|value| value.as_str())
-            .map(str::to_string)
+    /// The streaming session, for reads that need no Web API quota.
+    pub fn session(&self) -> &Session {
+        &self.session
     }
 
     pub fn shutdown(&self) {
@@ -497,7 +666,47 @@ impl Engine {
         self.player.stop();
     }
 
+    /// Ends the session but leaves the player playing, for an engine that
+    /// is not kept while the song it carries is (#268).
+    pub fn close_session(&self) {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.spirc.shutdown();
+    }
+
+    pub fn resume_point(&self) -> Option<PlaybackResume> {
+        if let Some(snapshot) = self.spirc.disconnected_playback() {
+            return Some(PlaybackResume::Session(snapshot));
+        }
+        self.interrupted().map(|interrupted| {
+            PlaybackResume::Track(LoadSpec {
+                uris: vec![interrupted.uri],
+                position_ms: interrupted.position_ms,
+                play: interrupted.playing,
+                ..LoadSpec::default()
+            })
+        })
+    }
+
+    pub fn resume(&self, resume: PlaybackResume) -> Result<()> {
+        // A carried song is picked up where it has got to, playing or
+        // paused as it is now, not where the session dropped: the player
+        // already has it, so the restore only lines its decoder up.
+        let now = self.carrying().then(|| self.keep_player().now()).flatten();
+        self.stop_carrying();
+        match resume_from(resume, now.as_ref()) {
+            PlaybackResume::Session(snapshot) => {
+                self.spirc.restore_playback(snapshot).map_err(Into::into)
+            }
+            PlaybackResume::Track(spec) => self.send_command(PlayerCommand::Load(spec)),
+        }
+    }
+
     pub fn command(&self, command: PlayerCommand) -> Result<()> {
+        if matches!(command, PlayerCommand::Load(_) | PlayerCommand::Transfer) {
+            // Something else chosen replaces the song a dropped session left.
+            self.stop_carrying();
+        }
         let interrupts_audio = command_interrupts_audio(
             &self.state.lock().unwrap_or_else(|p| p.into_inner()),
             &command,
@@ -519,13 +728,10 @@ impl Engine {
             PlayerCommand::Next => spirc.next()?,
             PlayerCommand::Previous => spirc.prev()?,
             PlayerCommand::ClearQueue => spirc.clear_queue()?,
-            PlayerCommand::AddToQueue(uri) => spirc.add_to_queue(uri)?,
+            PlayerCommand::AddToQueue(uri) => spirc.add_to_queue(SpotifyUri::from_uri(&uri)?)?,
             PlayerCommand::Seek(position_ms) => spirc.set_position_ms(position_ms)?,
-            PlayerCommand::Volume(volume) => {
-                self.mixer.set_volume(volume);
-                spirc.set_volume(volume)?;
-            }
-            PlayerCommand::VolumePreview(volume) => self.mixer.set_volume(volume),
+            PlayerCommand::Volume(volume) => self.note_volume(volume, false)?,
+            PlayerCommand::VolumePreview(volume) => self.note_volume(volume, true)?,
             PlayerCommand::Shuffle(enabled) => spirc.shuffle(enabled)?,
             PlayerCommand::Repeat(mode) => match mode {
                 RepeatMode::Off => {
@@ -541,23 +747,17 @@ impl Engine {
                     spirc.repeat_track(true)?;
                 }
             },
-            PlayerCommand::Activate => spirc.activate()?,
+            PlayerCommand::Transfer => spirc.transfer(None)?,
             PlayerCommand::Load(spec) => {
                 let playing_track = spec
                     .offset_uri
                     .clone()
                     .map(PlayingTrack::Uri)
                     .or_else(|| spec.offset_index.map(PlayingTrack::Index));
-                let context_options = if spec.autoplay {
-                    Some(LoadContextOptions::Autoplay)
-                } else {
-                    spec.shuffle.map(|shuffle| {
-                        LoadContextOptions::Options(Options {
-                            shuffle,
-                            ..Options::default()
-                        })
-                    })
-                };
+                // A load resets librespot's options, including repeat. Pass
+                // the user's preference even when shuffle is off.
+                let repeat = self.state.lock().unwrap_or_else(|p| p.into_inner()).repeat;
+                let context_options = Some(spec.context_options(repeat));
                 let options = LoadRequestOptions {
                     start_playing: spec.play,
                     seek_to: spec.position_ms,
@@ -579,12 +779,58 @@ impl Engine {
     }
 }
 
+/// What to pick up: `resume` as it was when the session dropped, or where a
+/// song the player carried through the reconnect is `now`.
+fn resume_from(resume: PlaybackResume, now: Option<&Interrupted>) -> PlaybackResume {
+    let Some(now) = now else {
+        return resume;
+    };
+    match resume {
+        PlaybackResume::Session(snapshot) => {
+            PlaybackResume::Session(Arc::new(snapshot.at_position(now.position_ms, now.playing)))
+        }
+        PlaybackResume::Track(mut spec) => {
+            if spec.uris.first() == Some(&now.uri) {
+                spec.position_ms = now.position_ms;
+                spec.play = now.playing;
+            }
+            PlaybackResume::Track(spec)
+        }
+    }
+}
+
+/// The session is gone. librespot's player does not stop with it, so a
+/// song playing or paused stays as it is until the next session takes it
+/// over or the player is stopped (#268); a shutdown asked for stops it.
+fn session_ended(state: &mut LocalState, shut_down: bool) {
+    state.connected = false;
+    if shut_down || !matches!(state.playback, Playback::Playing | Playback::Paused) {
+        state.playback = Playback::Stopped;
+        state.loading = false;
+        state.position_at = None;
+    }
+}
+
 fn command_interrupts_audio(state: &LocalState, command: &PlayerCommand) -> bool {
     state.playback == Playback::Playing
         && matches!(
             command,
             PlayerCommand::Next | PlayerCommand::Previous | PlayerCommand::Load(_)
         )
+}
+
+/// The librespot backend a saved setting names, when this build has it.
+///
+/// Spotifast's own output has always been saved as "rodio". librespot's
+/// rodio backend is no longer built in, so that name, an empty setting and
+/// any backend this build lacks all play through Spotifast's own output.
+fn librespot_backend(name: Option<&str>) -> Option<audio_backend::SinkBuilder> {
+    let name = name.filter(|name| *name != crate::sink::NAME)?;
+    let builder = audio_backend::find(Some(name.to_string()));
+    if builder.is_none() {
+        log::warn!("audio backend {name:?} is unavailable; using the default");
+    }
+    builder
 }
 
 /// Builds the audio sink and chooses where volume is applied.
@@ -617,28 +863,26 @@ fn sink_builder(
         };
         notify(EngineEvent::State(snapshot));
     });
-    if let Some(name) = config
-        .backend
-        .as_deref()
-        .filter(|name| *name != crate::sink::NAME)
-    {
-        match audio_backend::find(Some(name.to_string())) {
-            Some(builder) => {
-                // Apply volume after the tap so visualizers are independent of
-                // volume, including at zero.
-                let applied = mixer.get_soft_volume();
-                let normalisation = Arc::clone(&normalisation);
-                return (
-                    Box::new(move || {
-                        let sink = builder(device, AudioFormat::S16);
-                        Box::new(Tapped::new(sink, tap, applied, true, eq, normalisation))
-                            as Box<dyn Sink>
-                    }),
-                    Box::new(NoOpVolume),
-                );
-            }
-            None => log::warn!("audio backend {name:?} is unavailable; using the default"),
-        }
+    if let Some(builder) = librespot_backend(config.backend.as_deref()) {
+        // Apply volume after the tap so visualizers are independent of
+        // volume, including at zero.
+        let applied = mixer.get_soft_volume();
+        let normalisation = Arc::clone(&normalisation);
+        return (
+            Box::new(move || {
+                let sink = builder(device, AudioFormat::S16);
+                Box::new(Tapped::new(
+                    sink,
+                    audio,
+                    tap,
+                    applied,
+                    true,
+                    eq,
+                    normalisation,
+                )) as Box<dyn Sink>
+            }),
+            Box::new(NoOpVolume),
+        );
     }
     let volume = mixer.get_soft_volume();
     // The output applies volume to queued audio. The wrapper reads the same
@@ -646,11 +890,51 @@ fn sink_builder(
     let ceiling = mixer.get_soft_volume();
     (
         Box::new(move || {
-            let sink = Box::new(RodioSink::new(device, report, volume, buffer_ms, audio));
-            Box::new(Tapped::new(sink, tap, ceiling, false, eq, normalisation)) as Box<dyn Sink>
+            let sink = Box::new(RodioSink::new(
+                device,
+                report,
+                volume,
+                buffer_ms,
+                Arc::clone(&audio),
+            ));
+            Box::new(Tapped::new(
+                sink,
+                audio,
+                tap,
+                ceiling,
+                false,
+                eq,
+                normalisation,
+            )) as Box<dyn Sink>
         }),
         Box::new(NoOpVolume),
     )
+}
+
+/// What an engine is heard at, for the engine that replaces it.
+#[derive(Clone)]
+pub(crate) struct Heard {
+    state: Arc<Mutex<LocalState>>,
+}
+
+impl Heard {
+    /// The level set last, which the state holds exactly: a level set here
+    /// goes into the state with the mixer, and Connect reports every other
+    /// change of the level.
+    pub(crate) fn level(&self) -> u16 {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).volume
+    }
+
+    /// An engine heard at `volume`, for tests that have no engine.
+    #[cfg(test)]
+    pub(crate) fn at(volume: u16) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(LocalState {
+                volume,
+                ..LocalState::default()
+            })),
+        }
+    }
 }
 
 async fn run_events(
@@ -673,13 +957,7 @@ async fn run_events(
         {
             continue;
         }
-        match &event {
-            PlayerEvent::TrackChanged { .. } | PlayerEvent::Seeked { .. } => {
-                audio.track_changed();
-            }
-            PlayerEvent::Stopped { .. } => audio.stopped(),
-            _ => {}
-        }
+        audio.handle_player_event(&event);
         let snapshot = {
             let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
             if apply_event(&mut current, event) {
@@ -703,10 +981,21 @@ fn set<T: PartialEq>(target: &mut T, value: T) -> bool {
     }
 }
 
+/// Reports a replay's start position as a seek, once.
+fn start_replay(state: &mut LocalState) -> bool {
+    if std::mem::take(&mut state.replay_pending) {
+        state.seek_sequence = state.seek_sequence.wrapping_add(1);
+        true
+    } else {
+        false
+    }
+}
+
 fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
     match event {
         PlayerEvent::Stopped { .. } => {
             let mut changed = set(&mut state.playback, Playback::Stopped);
+            changed |= set(&mut state.loading, false);
             changed |= set(&mut state.position_ms, 0);
             changed |= set(&mut state.position_at, None);
             changed
@@ -717,22 +1006,26 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
             } else {
                 false
             };
+            changed |= set(&mut state.loading, true);
             changed |= set(&mut state.position_ms, position_ms);
             changed |= set(&mut state.position_at, None);
             changed |= set(&mut state.error, None);
             changed
         }
         PlayerEvent::Playing { position_ms, .. } => {
-            let mut changed = set(&mut state.playback, Playback::Playing);
-            changed |= set(&mut state.position_ms, position_ms);
+            set(&mut state.playback, Playback::Playing);
+            set(&mut state.position_ms, position_ms);
             state.position_at = Some(Instant::now());
-            changed || true
+            state.loading = false;
+            start_replay(state);
+            true
         }
         PlayerEvent::Paused { position_ms, .. } => {
             let mut changed = set(&mut state.playback, Playback::Paused);
+            changed |= set(&mut state.loading, false);
             changed |= set(&mut state.position_ms, position_ms);
             changed |= set(&mut state.position_at, None);
-            changed
+            changed | start_replay(state)
         }
         PlayerEvent::PositionCorrection { position_ms, .. }
         | PlayerEvent::PositionChanged { position_ms, .. } => {
@@ -751,21 +1044,39 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
             true
         }
         PlayerEvent::TrackChanged { audio_item } => {
-            let mut changed = set(&mut state.track, Some(local_track(&audio_item)));
-            changed |= set(&mut state.error, None);
+            let track = local_track(&audio_item);
+            state.replay_pending = state
+                .track
+                .as_ref()
+                .is_some_and(|previous| previous.uri == track.uri);
+            state.track = Some(track);
+            state.error = None;
+            // librespot emits this when a loaded track starts, including a
+            // repeat whose URI and metadata are identical to the previous play.
+            state.track_sequence = state.track_sequence.wrapping_add(1);
+            true
+        }
+        PlayerEvent::Unavailable { track_id, .. } => {
+            // A failed load never reaches Playing, so nothing else would
+            // turn the spinner off.
+            let mut changed = set(
+                &mut state.error,
+                Some(format!(
+                    "This item isn't available: {}",
+                    track_id.to_uri()
+                )),
+            );
+            changed |= set(&mut state.loading, false);
             changed
         }
-        PlayerEvent::Unavailable { track_id, .. } => set(
-            &mut state.error,
-            Some(format!(
-                "This item isn't available: {}",
-                track_id.to_uri().unwrap_or_default()
-            )),
-        ),
-        PlayerEvent::AudioKeyUnavailable { .. } => set(
-            &mut state.error,
-            Some("Spotify refused the audio key. Try again later".into()),
-        ),
+        PlayerEvent::AudioKeyUnavailable { .. } => {
+            let mut changed = set(
+                &mut state.error,
+                Some("Spotify refused the audio key. Try again later".into()),
+            );
+            changed |= set(&mut state.loading, false);
+            changed
+        }
         PlayerEvent::VolumeChanged { volume } => set(&mut state.volume, volume),
         PlayerEvent::SessionConnected { user_name, .. } => {
             let mut changed = set(&mut state.connected, true);
@@ -795,7 +1106,9 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
         | PlayerEvent::EndOfTrack { .. }
         | PlayerEvent::PlayRequestIdChanged { .. }
         | PlayerEvent::AutoPlayChanged { .. }
-        | PlayerEvent::FilterExplicitContentChanged { .. } => false,
+        | PlayerEvent::FilterExplicitContentChanged { .. }
+        // Only sent when `ConnectConfig::emit_set_queue_events` asks for it.
+        | PlayerEvent::SetQueue { .. } => false,
     }
 }
 
@@ -805,7 +1118,7 @@ fn local_track(item: &AudioItem) -> LocalTrack {
             artists
                 .iter()
                 .map(|artist| {
-                    let uri = artist.id.to_uri().ok();
+                    let uri = Some(artist.id.to_uri());
                     ArtistRef {
                         id: uri
                             .as_deref()
@@ -969,6 +1282,41 @@ fn decode_folder_name(encoded: &str) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn loading_another_song_keeps_repeat_with_or_without_shuffle() {
+        for shuffle in [None, Some(false), Some(true)] {
+            for mode in [RepeatMode::Off, RepeatMode::Context, RepeatMode::Track] {
+                let mut spec = LoadSpec {
+                    shuffle,
+                    ..LoadSpec::default()
+                };
+                let LoadContextOptions::Options(options) = spec.context_options(mode) else {
+                    panic!("ordinary playback must supply repeat options");
+                };
+                assert_eq!(options.shuffle, shuffle.unwrap_or(false));
+                assert_eq!(options.repeat, mode == RepeatMode::Context);
+                assert_eq!(options.repeat_track, mode == RepeatMode::Track);
+
+                // A user's new preference wins over an older player event,
+                // including turning repeat off immediately before a load.
+                spec.repeat = Some(mode);
+                let LoadContextOptions::Options(options) = spec.context_options(mode.next()) else {
+                    panic!("ordinary playback must supply repeat options");
+                };
+                assert_eq!(options.repeat, mode == RepeatMode::Context);
+                assert_eq!(options.repeat_track, mode == RepeatMode::Track);
+            }
+        }
+        assert!(matches!(
+            LoadSpec {
+                autoplay: true,
+                ..LoadSpec::default()
+            }
+            .context_options(RepeatMode::Context),
+            LoadContextOptions::Autoplay
+        ));
+    }
+
+    #[test]
     fn playback_metadata_preserves_each_artist_id_and_name() {
         use librespot_metadata::artist::{ArtistWithRole, ArtistsWithRole};
 
@@ -981,7 +1329,7 @@ mod tests {
         ];
         let item = AudioItem {
             track_id: uri(),
-            uri: uri().to_uri().unwrap(),
+            uri: uri().to_uri(),
             files: Default::default(),
             name: "Song".into(),
             covers: vec![],
@@ -1125,10 +1473,234 @@ mod tests {
     use super::*;
     use librespot_core::SpotifyUri;
 
+    /// Settings saved before librespot's rodio backend left the build name
+    /// "rodio", which has always meant Spotifast's own output; that and any
+    /// backend this build lacks still play, through that output.
+    #[test]
+    fn an_old_rodio_setting_plays_through_spotifasts_own_output() {
+        assert!(librespot_backend(Some("rodio")).is_none());
+        assert!(librespot_backend(None).is_none());
+        assert!(librespot_backend(Some("no-such-backend")).is_none());
+        assert!(
+            audio_backend::find(Some("rodio".into())).is_none(),
+            "librespot's rodio backend is not built in"
+        );
+        if cfg!(target_os = "linux") {
+            assert!(librespot_backend(Some("pulseaudio")).is_some());
+        }
+    }
+
+    /// #268: a dropped session leaves the song playing or paused where it
+    /// is, for the next session to pick up; a shutdown stops it.
+    #[test]
+    fn a_dropped_session_keeps_the_song_and_a_shutdown_stops_it() {
+        let playing = LocalState {
+            connected: true,
+            playback: Playback::Playing,
+            track: Some(LocalTrack {
+                uri: "spotify:track:left".into(),
+                ..LocalTrack::default()
+            }),
+            position_ms: 61_000,
+            position_at: Some(Instant::now()),
+            ..LocalState::default()
+        };
+        for playback in [Playback::Playing, Playback::Paused] {
+            let mut dropped = LocalState {
+                playback,
+                ..playing.clone()
+            };
+            session_ended(&mut dropped, false);
+            assert!(!dropped.connected);
+            assert_eq!(dropped.playback, playback);
+            assert!(dropped.interrupted().is_some());
+        }
+
+        let mut shut = playing.clone();
+        session_ended(&mut shut, true);
+        assert_eq!(shut.playback, Playback::Stopped);
+        assert_eq!(shut.position_at, None);
+
+        let mut loading = LocalState {
+            playback: Playback::Loading,
+            loading: true,
+            ..playing
+        };
+        session_ended(&mut loading, false);
+        assert_eq!(loading.playback, Playback::Stopped);
+        assert!(!loading.loading);
+    }
+
+    /// #268: the pickup of a song the player carried through the reconnect
+    /// starts where the song has got to, as it plays now; another song's
+    /// pickup is left as it was.
+    #[test]
+    fn a_carried_song_is_picked_up_where_it_has_got_to() {
+        let spec = LoadSpec {
+            uris: vec!["spotify:track:left".into()],
+            position_ms: 42_000,
+            play: true,
+            ..LoadSpec::default()
+        };
+        let now = Interrupted {
+            uri: "spotify:track:left".into(),
+            position_ms: 47_500,
+            playing: false,
+        };
+        let PlaybackResume::Track(picked) =
+            resume_from(PlaybackResume::Track(spec.clone()), Some(&now))
+        else {
+            panic!("a track pickup stays one");
+        };
+        assert_eq!((picked.position_ms, picked.play), (47_500, false));
+
+        let elsewhere = Interrupted {
+            uri: "spotify:track:other".into(),
+            ..now
+        };
+        let PlaybackResume::Track(kept) =
+            resume_from(PlaybackResume::Track(spec.clone()), Some(&elsewhere))
+        else {
+            panic!("a track pickup stays one");
+        };
+        assert_eq!(kept, spec);
+
+        let PlaybackResume::Track(untouched) =
+            resume_from(PlaybackResume::Track(spec.clone()), None)
+        else {
+            panic!("a track pickup stays one");
+        };
+        assert_eq!(untouched, spec);
+    }
+
     fn uri() -> SpotifyUri {
         SpotifyUri::from_uri("spotify:track:14XWXWv5FoCbFzLksawpEe").unwrap()
     }
 
+    fn interlude() -> AudioItem {
+        AudioItem {
+            track_id: uri(),
+            uri: uri().to_uri(),
+            files: Default::default(),
+            name: "Short interlude".into(),
+            covers: vec![],
+            language: vec![],
+            duration_ms: 40_000,
+            is_explicit: false,
+            availability: Ok(()),
+            alternatives: None,
+            unique_fields: UniqueFields::Track {
+                artists: librespot_metadata::artist::ArtistsWithRole(vec![]),
+                album: "Album".into(),
+                album_artists: vec![],
+                popularity: 0,
+                number: 1,
+                disc_number: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn each_loaded_track_has_a_new_history_sequence_but_seek_and_pause_do_not() {
+        let item = interlude();
+        let mut state = LocalState::default();
+        for sequence in [1, 2] {
+            assert!(apply_event(
+                &mut state,
+                PlayerEvent::TrackChanged {
+                    audio_item: Box::new(item.clone())
+                }
+            ));
+            assert_eq!(state.track_sequence, sequence);
+            for event in [
+                PlayerEvent::Playing {
+                    play_request_id: sequence,
+                    track_id: uri(),
+                    position_ms: 0,
+                },
+                PlayerEvent::Paused {
+                    play_request_id: sequence,
+                    track_id: uri(),
+                    position_ms: 20_000,
+                },
+                PlayerEvent::Seeked {
+                    play_request_id: sequence,
+                    track_id: uri(),
+                    position_ms: 0,
+                },
+                PlayerEvent::Playing {
+                    play_request_id: sequence,
+                    track_id: uri(),
+                    position_ms: 0,
+                },
+            ] {
+                apply_event(&mut state, event);
+                assert_eq!(state.track_sequence, sequence);
+            }
+        }
+    }
+
+    /// A track on repeat plays again with the same metadata, so only a
+    /// seek tells media controls that the position went back to the start
+    /// (#587). The position arrives with `Playing`, after `TrackChanged`.
+    #[test]
+    fn a_replay_of_the_same_track_reports_its_start_as_a_seek() {
+        let mut state = LocalState::default();
+        apply_event(
+            &mut state,
+            PlayerEvent::TrackChanged {
+                audio_item: Box::new(interlude()),
+            },
+        );
+        apply_event(
+            &mut state,
+            PlayerEvent::Playing {
+                play_request_id: 1,
+                track_id: uri(),
+                position_ms: 0,
+            },
+        );
+        let first_play = state.seek_sequence;
+        apply_event(
+            &mut state,
+            PlayerEvent::PositionChanged {
+                play_request_id: 1,
+                track_id: uri(),
+                position_ms: 39_900,
+            },
+        );
+
+        apply_event(
+            &mut state,
+            PlayerEvent::TrackChanged {
+                audio_item: Box::new(interlude()),
+            },
+        );
+        assert_eq!(
+            state.seek_sequence, first_play,
+            "the start position is not known yet"
+        );
+        apply_event(
+            &mut state,
+            PlayerEvent::Playing {
+                play_request_id: 2,
+                track_id: uri(),
+                position_ms: 0,
+            },
+        );
+        assert_eq!(state.seek_sequence, first_play + 1);
+        assert_eq!(state.position_ms, 0);
+
+        apply_event(
+            &mut state,
+            PlayerEvent::Paused {
+                play_request_id: 2,
+                track_id: uri(),
+                position_ms: 1_000,
+            },
+        );
+        assert_eq!(state.seek_sequence, first_play + 1, "reported once");
+    }
     #[test]
     fn position_interpolates_only_while_playing() {
         let mut state = LocalState {
@@ -1159,6 +1731,83 @@ mod tests {
         assert_eq!(state.playback, Playback::Playing);
     }
 
+    /// Every skip and end-of-track advance loads while the previous track
+    /// still shows as playing. The load itself is carried by `loading`, so
+    /// the button spinner follows the engine without flipping the transport.
+    #[test]
+    fn a_mid_song_load_marks_the_state_loading_until_it_starts() {
+        let mut state = LocalState {
+            playback: Playback::Playing,
+            ..LocalState::default()
+        };
+        assert!(apply_event(
+            &mut state,
+            PlayerEvent::Loading {
+                play_request_id: 2,
+                track_id: uri(),
+                position_ms: 30_000,
+            },
+        ));
+        assert_eq!(state.playback, Playback::Playing);
+        assert!(state.loading);
+
+        apply_event(
+            &mut state,
+            PlayerEvent::Playing {
+                play_request_id: 2,
+                track_id: uri(),
+                position_ms: 0,
+            },
+        );
+        assert!(!state.loading);
+
+        apply_event(
+            &mut state,
+            PlayerEvent::Loading {
+                play_request_id: 3,
+                track_id: uri(),
+                position_ms: 0,
+            },
+        );
+        assert!(state.loading);
+        apply_event(
+            &mut state,
+            PlayerEvent::Stopped {
+                play_request_id: 3,
+                track_id: uri(),
+            },
+        );
+        assert!(!state.loading);
+
+        // A load that fails has no Playing to clear the spinner, so the
+        // failure events must do it themselves.
+        for failure in 4..=5 {
+            apply_event(
+                &mut state,
+                PlayerEvent::Loading {
+                    play_request_id: failure,
+                    track_id: uri(),
+                    position_ms: 0,
+                },
+            );
+            assert!(state.loading);
+            let failed = if failure == 4 {
+                PlayerEvent::Unavailable {
+                    play_request_id: failure,
+                    track_id: uri(),
+                }
+            } else {
+                PlayerEvent::AudioKeyUnavailable {
+                    play_request_id: failure,
+                    track_id: uri(),
+                }
+            };
+            apply_event(&mut state, failed);
+            assert!(!state.loading, "failure {failure} stops the spinner");
+            assert!(state.error.is_some(), "failure {failure} reports why");
+        }
+    }
+
     #[test]
     fn replacing_a_playing_track_interrupts_queued_audio() {
         let playing = LocalState {
@@ -1186,7 +1835,7 @@ mod tests {
     fn an_inactive_connect_device_keeps_its_engine_session() {
         let mut state = LocalState {
             connected: true,
-            active_client: "Fastpotify".into(),
+            active_client: "Spotifast".into(),
             ..LocalState::default()
         };
 
@@ -1233,7 +1882,7 @@ mod tests {
             buffer_ms: crate::sink::DEFAULT_BUFFER_MS,
             tap: AudioTap::new(),
             eq: crate::eq::shared(),
-            device_name: "Fastpotify".into(),
+            device_name: "Spotifast".into(),
             bitrate_kbps: 320,
             normalisation: false,
             autoplay: true,
@@ -1244,6 +1893,8 @@ mod tests {
             volume_dir: PathBuf::new(),
             audio_cache_dir: None,
             audio_cache_limit: None,
+            proxy: crate::settings::ProxyConfig::Off,
+            local_files: None,
         };
         let id = config.device_id();
         assert_eq!(id.len(), 40);
@@ -1276,5 +1927,12 @@ mod tests {
         state.playback = Playback::Playing;
         state.track = None;
         assert!(state.interrupted().is_none());
+    }
+
+    /// The next engine starts at the level set last, exactly.
+    #[test]
+    fn an_engine_is_heard_at_the_level_set_last() {
+        let set_here = 3276;
+        assert_eq!(Heard::at(set_here).level(), set_here);
     }
 }

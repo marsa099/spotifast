@@ -4,99 +4,42 @@ use std::sync::Arc;
 
 use egui::{CornerRadius, Layout, Rect, Sense, UiBuilder, Vec2, pos2, vec2};
 
-use crate::api::models::{Episode, PlayableItem, pick_image};
+use crate::api::models::{Episode, PlayableItem, Show, pick_image};
 use crate::app::App;
+use crate::i18n::{gettext, ngettext};
 use crate::model::{Action, Loadable, Page, RowContext};
 use crate::theme::{self, Icon};
 use crate::util;
 
-use super::collection::{Hero, hero};
+use super::collection::{Hero, HeroArt, hero, hero_images, refresh_menu_item};
 use super::widgets;
 
 pub const EPISODE_ROW_HEIGHT: f32 = 128.0;
+/// The cover of an episode row.
+const EPISODE_ART: f32 = 96.0;
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
-    let Some(page) = app.show_pages.remove(id) else {
+    if !app.show_pages.contains_key(id) {
         app.ensure_loaded(Page::Show(id.to_string()));
+    }
+    let Some(page) = app.show_pages.remove(id) else {
         return;
     };
+    let preview = super::loading_preview(ui.ctx(), id, &page.show, || app.known_show(id).cloned());
     let palette = app.palette;
+    let locale = app.locale;
     match &page.show {
         Loadable::Loaded(show) => {
-            let mut byline = vec![(show.publisher.clone(), None)];
-            if let Some(total) = show.total_episodes {
-                byline.push((format!("{total} episodes"), None));
-            }
-            hero(
+            show_hero(app, ui, show, preview.as_deref());
+            show_actions(
                 app,
                 ui,
-                Hero {
-                    image: pick_image(&show.images, 300),
-                    liked: false,
-                    kind: "Podcast",
-                    title: &show.name,
-                    description: None,
-                    byline,
-                    round: false,
-                },
+                show,
+                page.episodes.items.first(),
+                page.episodes.loading,
             );
-            let saved = app.is_saved(&show.uri).unwrap_or(false);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 18.0;
-                if let Some(latest) = page.episodes.items.first() {
-                    let uri = latest.uri.clone();
-                    if app.play_pending(&uri) {
-                        theme::circle_spinner(
-                            ui,
-                            56.0,
-                            palette.accent,
-                            palette.on_accent,
-                            "Starting…",
-                        );
-                    } else if theme::circle_button(
-                        ui,
-                        Icon::PlayFilled,
-                        56.0,
-                        palette.accent,
-                        palette.accent_hover,
-                        palette.on_accent,
-                        "Play latest episode",
-                    )
-                    .clicked()
-                    {
-                        app.actions.push(Action::PlayUris {
-                            uris: vec![uri],
-                            index: 0,
-                        });
-                    }
-                }
-                let (icon, color, tooltip) = if saved {
-                    (
-                        Icon::CircleCheck,
-                        palette.accent,
-                        "Remove from Your Library",
-                    )
-                } else {
-                    (Icon::CirclePlus, palette.secondary, "Follow podcast")
-                };
-                if theme::icon_button(ui, icon, 26.0, color, palette.text, tooltip).clicked() {
-                    app.actions.push(Action::ToggleSaved(show.uri.clone()));
-                }
-                let more = theme::icon_button(
-                    ui,
-                    Icon::Ellipsis,
-                    26.0,
-                    palette.secondary,
-                    palette.text,
-                    "More",
-                );
-                egui::Popup::menu(&more)
-                    .frame(widgets::menu_frame(&palette))
-                    .show(|ui| widgets::context_menu_items(ui, app, &show.uri, &show.name, None));
-            });
-            ui.add_space(16.0);
             if !show.description.is_empty() {
-                theme::section_title(ui, &palette, "About");
+                theme::section_title(ui, &palette, &gettext(locale, "About"));
                 ui.add_space(4.0);
                 let description = util::strip_html(&show.description);
                 let galley = crate::bidi::layout(
@@ -111,38 +54,221 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 ui.add(egui::Label::new(galley));
                 ui.add_space(16.0);
             }
-            theme::section_title(ui, &palette, "All episodes");
+            theme::section_title(ui, &palette, &gettext(locale, "All episodes"));
             ui.add_space(6.0);
             let episodes = page.episodes.items.clone();
-            let show_image = pick_image(&show.images, 64).map(str::to_string);
-            widgets::virtual_rows(ui, episodes.len(), EPISODE_ROW_HEIGHT, |ui, index| {
-                episode_row(app, ui, &episodes[index], show_image.as_deref());
-            });
-            if page.episodes.loading {
-                widgets::loading_row(ui, &palette);
+            let show_image = pick_image(&show.images, app.art_px(EPISODE_ART)).map(str::to_string);
+            if episodes.is_empty() && !app.network_reachable {
+                widgets::empty_state(
+                    ui,
+                    &palette,
+                    Icon::WifiOff,
+                    &gettext(locale, "You're offline"),
+                    &gettext(
+                        locale,
+                        "Spotifast will reconnect automatically when your connection returns.",
+                    ),
+                );
+            } else {
+                let render_episodes = |ui: &mut egui::Ui, app: &mut App| {
+                    widgets::virtual_rows(ui, episodes.len(), EPISODE_ROW_HEIGHT, |ui, index| {
+                        episode_row(app, ui, &episodes[index], show_image.as_deref());
+                    });
+                };
+                if !app.network_reachable {
+                    ui.add_enabled_ui(false, |ui| {
+                        ui.multiply_opacity(0.55);
+                        render_episodes(ui, app);
+                    });
+                } else {
+                    render_episodes(ui, app);
+                }
+                if page.episodes.loading {
+                    widgets::loading_row(ui, &palette, app.locale);
+                }
+                if let Some(error) = &page.episodes.error {
+                    let error = error.clone();
+                    widgets::error_row(ui, app, &error, Some(Page::Show(id.to_string())));
+                }
+                widgets::load_more_when_near_end(
+                    ui,
+                    app,
+                    Page::Show(id.to_string()),
+                    page.episodes.can_load_more(),
+                );
             }
-            if let Some(error) = &page.episodes.error {
-                let error = error.clone();
-                widgets::error_row(ui, app, &error, Some(Page::Show(id.to_string())));
-            }
-            widgets::load_more_when_near_end(
-                ui,
-                app,
-                Page::Show(id.to_string()),
-                page.episodes.can_load_more(),
-            );
         }
         Loadable::Loading | Loadable::NotLoaded => {
-            ui.add_space(40.0);
-            widgets::loading_row(ui, &palette);
+            if let Some(show) = &preview {
+                show_hero(app, ui, show, None);
+            } else {
+                ui.add_space(40.0);
+            }
+            if !app.network_reachable {
+                widgets::empty_state(
+                    ui,
+                    &palette,
+                    Icon::WifiOff,
+                    &gettext(app.locale, "You're offline"),
+                    &gettext(
+                        app.locale,
+                        "Spotifast will reconnect automatically when your connection returns.",
+                    ),
+                );
+            } else {
+                if let Some(show) = &preview {
+                    ui.add_enabled_ui(false, |ui| {
+                        show_actions(app, ui, show, None, true);
+                    });
+                }
+                widgets::skeleton_rows(ui, &palette, app.locale, 6);
+            }
         }
         Loadable::Failed(error) => {
             let error = error.clone();
-            ui.add_space(40.0);
-            widgets::error_row(ui, app, &error, Some(Page::Show(id.to_string())));
+            if let Some(show) = &preview {
+                show_hero(app, ui, show, None);
+            } else {
+                ui.add_space(40.0);
+            }
+            if !app.network_reachable
+                || error.contains("network error")
+                || error.contains("Network connection error")
+            {
+                widgets::empty_state(
+                    ui,
+                    &palette,
+                    Icon::WifiOff,
+                    &gettext(app.locale, "You're offline"),
+                    &gettext(
+                        app.locale,
+                        "Spotifast will reconnect automatically when your connection returns.",
+                    ),
+                );
+            } else {
+                if let Some(show) = &preview {
+                    ui.add_enabled_ui(false, |ui| {
+                        show_actions(app, ui, show, None, true);
+                    });
+                }
+                widgets::error_row(ui, app, &error, Some(Page::Show(id.to_string())));
+            }
         }
     }
     app.show_pages.insert(id.to_string(), page);
+}
+
+fn show_hero(app: &mut App, ui: &mut egui::Ui, show: &Show, preview: Option<&Show>) {
+    let locale = app.locale;
+    let mut byline = vec![(show.publisher.clone(), None)];
+    if let Some(total) = show.total_episodes {
+        byline.push((
+            ngettext(
+                locale,
+                // Translators: {count} is the number of episodes of a podcast.
+                "{count} episode",
+                "{count} episodes",
+                total,
+            )
+            .replace("{count}", &total.to_string()),
+            None,
+        ));
+    }
+    let images = hero_images(
+        &show.images,
+        preview.map(|show| show.images.as_slice()),
+        false,
+        HeroArt::of(app),
+    );
+    hero(
+        app,
+        ui,
+        Hero {
+            images,
+            liked: false,
+            kind: gettext(locale, "Podcast"),
+            title: &show.name,
+            description: None,
+            byline,
+            avatar: None,
+            round: false,
+        },
+    );
+}
+
+fn show_actions(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    show: &Show,
+    latest: Option<&Episode>,
+    refreshing: bool,
+) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let saved = app.is_saved(&show.uri).unwrap_or(false);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 18.0;
+        if let Some(latest) = latest {
+            if app.play_pending(&latest.uri) {
+                theme::circle_spinner(
+                    ui,
+                    56.0,
+                    palette.accent,
+                    palette.on_accent,
+                    &gettext(locale, "Starting…"),
+                );
+            } else if theme::circle_button(
+                ui,
+                Icon::PlayFilled,
+                56.0,
+                palette.accent,
+                palette.accent_hover,
+                palette.on_accent,
+                &gettext(locale, "Play latest episode"),
+            )
+            .clicked()
+            {
+                app.actions.push(Action::PlayEpisode {
+                    uri: latest.uri.clone(),
+                    resume_ms: latest.resume_ms(),
+                });
+            }
+        }
+        let (icon, color, tooltip) = if saved {
+            (
+                Icon::CircleCheck,
+                palette.accent,
+                gettext(locale, "Remove from Your Library"),
+            )
+        } else {
+            (
+                Icon::CirclePlus,
+                palette.secondary,
+                gettext(locale, "Follow podcast"),
+            )
+        };
+        if theme::icon_button(ui, icon, 26.0, color, palette.text, &tooltip).clicked() {
+            app.actions.push(Action::ToggleSaved(show.uri.clone()));
+        }
+        let more = theme::icon_button(
+            ui,
+            Icon::Ellipsis,
+            26.0,
+            palette.secondary,
+            palette.text,
+            &gettext(locale, "More"),
+        );
+        egui::Popup::menu(&more)
+            .frame(widgets::menu_frame(&palette))
+            .show(|ui| {
+                widgets::context_menu_items(ui, app, &show.uri, &show.name, None);
+                if app.network_reachable {
+                    widgets::menu_separator(ui, &palette);
+                    refresh_menu_item(app, ui, &Page::Show(show.id.clone()), refreshing);
+                }
+            });
+    });
+    ui.add_space(16.0);
 }
 
 /// One episode with its description, date, length, and progress.
@@ -153,6 +279,7 @@ pub fn episode_row(
     fallback_image: Option<&str>,
 ) {
     let palette = app.palette;
+    let locale = app.locale;
     let (rect, response) = ui.allocate_exact_size(
         vec2(ui.available_width(), EPISODE_ROW_HEIGHT),
         Sense::click(),
@@ -171,8 +298,8 @@ pub fn episode_row(
         );
     }
     let inner = rect.shrink2(vec2(12.0, 12.0));
-    let cover_rect = Rect::from_min_size(inner.min, Vec2::splat(96.0));
-    let image = pick_image(&episode.images, 64).or(fallback_image);
+    let cover_rect = Rect::from_min_size(inner.min, Vec2::splat(EPISODE_ART));
+    let image = pick_image(&episode.images, app.art_px(EPISODE_ART)).or(fallback_image);
     widgets::paint_cover(
         ui,
         &palette,
@@ -241,7 +368,13 @@ pub fn episode_row(
         Icon::PlayFilled
     };
     if app.play_pending(&episode.uri) {
-        theme::circle_spinner(&mut child, 32.0, palette.text, palette.window, "Starting…");
+        theme::circle_spinner(
+            &mut child,
+            32.0,
+            palette.text,
+            palette.window,
+            &gettext(locale, "Starting…"),
+        );
     } else if theme::circle_button(
         &mut child,
         icon,
@@ -253,22 +386,22 @@ pub fn episode_row(
             palette.text
         },
         palette.window,
-        "Play",
+        &gettext(locale, "Play"),
     )
     .clicked()
     {
         if is_current {
             app.actions.push(Action::TogglePlay);
         } else {
-            app.actions.push(Action::PlayUris {
-                uris: vec![episode.uri.clone()],
-                index: 0,
+            app.actions.push(Action::PlayEpisode {
+                uri: episode.uri.clone(),
+                resume_ms: episode.resume_ms(),
             });
         }
     }
     let mut meta = Vec::new();
     if let Some(date) = &episode.release_date {
-        meta.push(util::format_date(date));
+        meta.push(util::format_date(app.locale, date));
     }
     let resume = episode.resume_point.as_ref();
     let remaining = resume
@@ -279,8 +412,12 @@ pub fn episode_row(
                 .saturating_sub(resume.resume_position_ms)
         });
     match remaining {
-        Some(left) => meta.push(format!("{} left", util::format_episode_ms(left))),
-        None => meta.push(util::format_episode_ms(episode.duration_ms)),
+        Some(left) => meta.push(
+            // Translators: {duration} is the time left in an episode, such as "12 min".
+            gettext(locale, "{duration} left")
+                .replace("{duration}", &util::format_episode_ms(app.locale, left)),
+        ),
+        None => meta.push(util::format_episode_ms(app.locale, episode.duration_ms)),
     }
     let meta_text = meta.join(" • ");
     let meta_galley =
@@ -299,7 +436,7 @@ pub fn episode_row(
             ui.painter().text(
                 pos2(x + 20.0, footer_y),
                 egui::Align2::LEFT_CENTER,
-                "Played",
+                gettext(locale, "Played"),
                 theme::regular(12.0),
                 palette.secondary,
             );
@@ -327,7 +464,7 @@ pub fn episode_row(
         18.0,
         palette.secondary,
         palette.text,
-        "More",
+        &gettext(locale, "More"),
     );
     let item = PlayableItem::Episode(episode.clone());
     egui::Popup::menu(&more)
@@ -337,10 +474,126 @@ pub fn episode_row(
         .frame(widgets::menu_frame(&palette))
         .show(|ui| widgets::item_menu(ui, app, &item, None, None));
     if response.double_clicked() {
-        app.actions.push(Action::PlayUris {
-            uris: vec![episode.uri.clone()],
-            index: 0,
+        app.actions.push(Action::PlayEpisode {
+            uri: episode.uri.clone(),
+            resume_ms: episode.resume_ms(),
         });
     }
     let _ = RowContext::Uris(Arc::from([]));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> App {
+        let root = std::env::temp_dir().join(format!(
+            "spotifast-show-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        App::new(
+            &crate::backend::Waker::default(),
+            crate::paths::AppDirs {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+            },
+            crate::settings::Settings::default(),
+            crate::app::AppOptions {
+                media_controls: false,
+                restore_sign_in: false,
+                tray: false,
+                autostart: false,
+            },
+        )
+    }
+
+    /// A podcast's More menu offers the playlist page's Refresh, which
+    /// reloads the podcast, and reads Refreshing… while it loads.
+    #[test]
+    fn podcast_more_menu_refreshes_the_podcast() {
+        let show = Show {
+            id: "sh1".into(),
+            uri: "spotify:show:sh1".into(),
+            name: "Rework".into(),
+            ..Show::default()
+        };
+        for refreshing in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            theme::install(&ctx);
+            let mut app = test_app();
+            let mut frame = |events| {
+                app.actions.clear();
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(800.0, 520.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| show_actions(&mut app, ui, &show, None, refreshing),
+                );
+                output.textures_delta.clear();
+                (
+                    output.platform_output.accesskit_update.unwrap(),
+                    std::mem::take(&mut app.actions),
+                )
+            };
+            let locate = |tree: &egui::accesskit::TreeUpdate, label: &str| {
+                let (_, node) = tree
+                    .nodes
+                    .iter()
+                    .find(|(_, n)| n.label() == Some(label))
+                    .unwrap_or_else(|| panic!("missing {label}"));
+                let b = node.bounds().unwrap();
+                (
+                    node.is_disabled(),
+                    pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32),
+                )
+            };
+            let click = |pos| {
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]
+            };
+            frame(vec![]);
+            let (closed, _) = frame(vec![]);
+            let (_, more) = locate(&closed, "More");
+            frame(click(more));
+            let (open, _) = frame(vec![]);
+            if refreshing {
+                let (disabled, _) = locate(&open, "Refreshing…");
+                assert!(disabled, "no second refresh while one loads");
+                continue;
+            }
+            let (disabled, refresh) = locate(&open, "Refresh");
+            assert!(!disabled);
+            let (_, actions) = frame(click(refresh));
+            assert!(
+                actions
+                    .iter()
+                    .any(|action| matches!(action, Action::Reload(Page::Show(id)) if id == "sh1")),
+                "Refresh reloads the podcast: {actions:?}"
+            );
+        }
+    }
 }

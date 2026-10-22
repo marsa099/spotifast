@@ -1,16 +1,20 @@
 //! Widgets shared by every view: covers, cards, track rows, menus, sliders.
 
 use egui::{
-    Align, Color32, CornerRadius, Layout, Rect, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2,
+    Align, Color32, CornerRadius, Frame, Layout, Margin, Rect, Sense, Stroke, Ui, UiBuilder, Vec2,
+    pos2, vec2,
 };
 
 use crate::api::models::*;
 use crate::app::App;
+use crate::i18n::{Locale, gettext, ngettext, pgettext};
 use crate::model::{Action, Dialog, DragEntry, DragTrack, Page, RowContext, RowPick};
 use crate::theme::{self, Icon, Palette};
 use crate::util;
 
 pub const CARD_WIDTH: f32 = 172.0;
+/// The cover inside a card, within its 12 point padding.
+pub const CARD_ART: f32 = CARD_WIDTH - 24.0;
 pub const CARD_GAP: f32 = 14.0;
 pub const PAGE_PADDING: f32 = 24.0;
 
@@ -28,6 +32,15 @@ pub fn cover(
     rect
 }
 
+#[derive(Default)]
+pub(super) struct CoverSources<'a> {
+    pub requested: Option<&'a str>,
+    pub previous: Option<&'a str>,
+    pub softened: Option<&'a egui::TextureHandle>,
+    pub thumbnail: Option<&'a str>,
+    pub align_thumbnail: bool,
+}
+
 pub fn paint_cover(
     ui: &Ui,
     palette: &Palette,
@@ -37,48 +50,58 @@ pub fn paint_cover(
     fallback: Icon,
     art: Option<&crate::images::ArtLoader>,
 ) {
+    paint_cover_with_thumbnail(
+        ui,
+        palette,
+        CoverSources {
+            requested: url,
+            ..Default::default()
+        },
+        rect,
+        radius,
+        fallback,
+        art,
+    );
+}
+
+/// Paints the requested cover, keeping a softened thumbnail visible until it
+/// is ready.
+pub(super) fn paint_cover_with_thumbnail(
+    ui: &Ui,
+    palette: &Palette,
+    sources: CoverSources<'_>,
+    rect: Rect,
+    radius: f32,
+    fallback: Icon,
+    art: Option<&crate::images::ArtLoader>,
+) {
     if !ui.is_rect_visible(rect) {
         return;
     }
-    if let (Some(url), Some(art)) = (url, art) {
-        art.touch(url);
-    }
     let corner = CornerRadius::same(radius.min(127.0) as u8);
-    let painter = ui.painter();
-    let loaded = url.is_some_and(|url| {
-        let image = egui::Image::new(url).show_loading_spinner(false);
-        let Ok(egui::load::TexturePoll::Ready { texture }) =
-            image.load_for_size(ui.ctx(), rect.size())
-        else {
-            return false;
-        };
-        if let Some(art) = art {
-            art.release_bytes(url);
-            art.note_decoded(
-                url,
-                texture.size.x.round() as usize,
-                texture.size.y.round() as usize,
+    let at = |url| CoverAt { url, rect, corner };
+    // A copy at this size, or while it is made, the nearest copy of the
+    // same artwork already on the GPU.
+    let loaded = sources.requested.is_some_and(|url| {
+        paint_cover_url(ui, at(url), art, false) || paint_nearest_copy(ui, at(url), art)
+    }) || sources
+        .previous
+        .is_some_and(|url| paint_ready_cover_url(ui, at(url), art))
+        || sources.softened.is_some_and(|texture| {
+            paint_cover_texture(
+                ui,
+                egui::load::SizedTexture::from_handle(texture),
+                rect,
+                corner,
+                sources.align_thumbnail,
             );
-        }
-
-        let image_aspect = texture.size.x / texture.size.y;
-        let rect_aspect = rect.width() / rect.height();
-        let uv = if image_aspect > rect_aspect {
-            let visible_width = rect_aspect / image_aspect;
-            let inset = (1.0 - visible_width) / 2.0;
-            Rect::from_min_max(pos2(inset, 0.0), pos2(1.0 - inset, 1.0))
-        } else {
-            let visible_height = image_aspect / rect_aspect;
-            let inset = (1.0 - visible_height) / 2.0;
-            Rect::from_min_max(pos2(0.0, inset), pos2(1.0, 1.0 - inset))
-        };
-        egui::Image::new(texture)
-            .uv(uv)
-            .corner_radius(corner)
-            .paint_at(ui, rect);
-        true
-    });
+            true
+        })
+        || sources
+            .thumbnail
+            .is_some_and(|url| paint_cover_url(ui, at(url), art, sources.align_thumbnail));
     if !loaded {
+        let painter = ui.painter();
         let fill = if palette.dark {
             palette.surface_hover
         } else {
@@ -92,6 +115,199 @@ pub fn paint_cover(
         let icon_size = (rect.width() * 0.42).clamp(12.0, 64.0);
         theme::paint_icon(ui, fallback, rect, icon_size, palette.dim);
     }
+}
+
+/// A cover to paint: its artwork, where it goes, and its corners.
+#[derive(Clone, Copy)]
+struct CoverAt<'a> {
+    url: &'a str,
+    rect: Rect,
+    corner: CornerRadius,
+}
+
+/// Paints `cover`'s artwork only if it needs no wait on the network: a
+/// copy made from bytes already loaded, or one already on the GPU.
+fn paint_ready_cover_url(
+    ui: &Ui,
+    cover: CoverAt<'_>,
+    art: Option<&crate::images::ArtLoader>,
+) -> bool {
+    art.is_some_and(|art| art.is_ready(cover.url)) && paint_cover_url(ui, cover, art, false)
+        || paint_nearest_copy(ui, cover, art)
+}
+
+/// The size of the copy of a cover drawn at `rect`.
+fn cover_copy_pixels(ui: &Ui, rect: Rect) -> u32 {
+    crate::images::cover_pixels(rect.width().max(rect.height()) * ui.ctx().pixels_per_point())
+}
+
+/// Paints the copy of `cover`'s artwork already on the GPU that is nearest
+/// the size it is drawn at, without asking for one to be made. The artwork
+/// loader's bytes may be on their way back from the disk for another size
+/// meanwhile; the copy is the texture egui already holds.
+fn paint_nearest_copy(ui: &Ui, cover: CoverAt<'_>, art: Option<&crate::images::ArtLoader>) -> bool {
+    let Some(art) = art else {
+        return false;
+    };
+    let Some(uri) = art.nearest_copy(cover.url, cover_copy_pixels(ui, cover.rect)) else {
+        return false;
+    };
+    let image = egui::Image::new(uri.as_str())
+        .texture_options(crate::images::COVER_TEXTURE)
+        .show_loading_spinner(false);
+    let Ok(egui::load::TexturePoll::Ready { texture }) =
+        image.load_for_size(ui.ctx(), cover.rect.size())
+    else {
+        return false;
+    };
+    art.touch(cover.url);
+    let [width, height] = [texture.size.x, texture.size.y].map(|side| side.round() as usize);
+    art.note_texture(cover.url, &uri, width, height);
+    paint_cover_texture(ui, texture, cover.rect, cover.corner, false);
+    true
+}
+
+/// How long after it was last the playing song's the last song's cover may
+/// stand in for the next one's: long enough for a cover to load, short enough
+/// that one which cannot be had, or a song after a gap, shows the placeholder.
+const PLAYING_COVER_HOLD: f64 = 2.0;
+
+/// The playing song's cover last shown whole in one place, and the input
+/// time it was last the one asked for there.
+#[derive(Clone)]
+struct ShownCover {
+    url: std::sync::Arc<str>,
+    seen: f64,
+}
+
+/// The cover that stands in for `url`'s while it loads: the last one shown,
+/// if it was another song's and it was the one asked for a moment ago.
+fn stand_in(
+    shown: Option<&ShownCover>,
+    url: Option<&str>,
+    now: f64,
+) -> Option<std::sync::Arc<str>> {
+    let shown = shown?;
+    (url.is_some_and(|url| *shown.url != *url) && now - shown.seen < PLAYING_COVER_HOLD)
+        .then(|| std::sync::Arc::clone(&shown.url))
+}
+
+/// Paints the playing song's cover. A new song's cover still being made
+/// keeps the last song's in its place for a moment, so a change of song
+/// does not pass through the placeholder. `key` tells apart the places that
+/// show it.
+pub fn playing_cover(
+    ui: &Ui,
+    palette: &Palette,
+    art: &crate::images::ArtLoader,
+    key: &str,
+    url: Option<&str>,
+    rect: Rect,
+    radius: f32,
+) {
+    let id = egui::Id::new(("playing-cover", key));
+    let now = ui.input(|input| input.time);
+    let shown = ui.ctx().data(|data| data.get_temp::<ShownCover>(id));
+    let previous = stand_in(shown.as_ref(), url, now);
+    paint_cover_with_thumbnail(
+        ui,
+        palette,
+        CoverSources {
+            requested: url,
+            previous: previous.as_deref(),
+            ..Default::default()
+        },
+        rect,
+        radius,
+        Icon::Music,
+        Some(art),
+    );
+    // Remembered while its own cover has a copy, from the frame it shows.
+    if let Some(url) = url
+        && art.has_copy(url)
+    {
+        let url = match shown {
+            Some(shown) if *shown.url == *url => shown.url,
+            _ => std::sync::Arc::from(url),
+        };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(id, ShownCover { url, seen: now }));
+    }
+}
+
+/// Paints `cover`'s artwork from a copy scaled on the CPU to the pixels it
+/// covers, so the GPU holds no more than the screen shows and fine detail
+/// survives. Artwork that is not fetched over the network is drawn as it is.
+fn paint_cover_url(
+    ui: &Ui,
+    cover: CoverAt<'_>,
+    art: Option<&crate::images::ArtLoader>,
+    shift_thumbnail: bool,
+) -> bool {
+    let CoverAt { url, rect, corner } = cover;
+    if let Some(art) = art {
+        art.touch(url);
+    }
+    let scaled = (url.starts_with("https://") || url.starts_with("http://"))
+        .then(|| crate::images::scaled_uri(url, cover_copy_pixels(ui, rect)));
+    let uri = scaled.as_deref().unwrap_or(url);
+    let image = egui::Image::new(uri)
+        .texture_options(crate::images::COVER_TEXTURE)
+        .show_loading_spinner(false);
+    let Ok(egui::load::TexturePoll::Ready { texture }) = image.load_for_size(ui.ctx(), rect.size())
+    else {
+        return false;
+    };
+    match art {
+        Some(art) => {
+            let [width, height] =
+                [texture.size.x, texture.size.y].map(|side| side.round() as usize);
+            // Only on the frame this copy's texture first appears: the same
+            // artwork can be wanted at another size, a row's and a page
+            // header's, and releasing the bytes on every frame of the one
+            // already made would snatch them from the other each time they
+            // came back from the disk, so it never got made.
+            if art.note_texture(url, uri, width, height) {
+                art.release_bytes(url);
+                crate::images::forget_decoded(ui.ctx(), uri);
+            }
+        }
+        // Nothing tracks this cover's copies, so let go of the decoded one
+        // as soon as egui holds the texture.
+        None => crate::images::forget_decoded(ui.ctx(), uri),
+    }
+    paint_cover_texture(ui, texture, rect, corner, shift_thumbnail);
+    true
+}
+
+fn paint_cover_texture(
+    ui: &Ui,
+    texture: egui::load::SizedTexture,
+    rect: Rect,
+    corner: CornerRadius,
+    shift_thumbnail: bool,
+) {
+    let image_aspect = texture.size.x / texture.size.y;
+    let rect_aspect = rect.width() / rect.height();
+    let mut uv = if image_aspect > rect_aspect {
+        let visible_width = rect_aspect / image_aspect;
+        let inset = (1.0 - visible_width) / 2.0;
+        Rect::from_min_max(pos2(inset, 0.0), pos2(1.0 - inset, 1.0))
+    } else {
+        let visible_height = image_aspect / rect_aspect;
+        let inset = (1.0 - visible_height) / 2.0;
+        Rect::from_min_max(pos2(0.0, inset), pos2(1.0, 1.0 - inset))
+    };
+    if shift_thumbnail {
+        // Spotify's larger rendition lands about one thumbnail texel down
+        // and right. Crop the preview's last row and column so it starts in
+        // that same position and holds still when the full cover replaces it.
+        uv.max -= uv.size() / 64.0;
+    }
+    egui::Image::new(texture)
+        .uv(uv)
+        .corner_radius(corner)
+        .paint_at(ui, rect);
 }
 
 /// A soft drop shadow under a cover or card.
@@ -215,6 +431,20 @@ pub fn menu_item_enabled(
     label: &str,
     enabled: bool,
 ) -> bool {
+    menu_item_response(ui, palette, icon, label, enabled, false).1
+}
+
+/// A menu item that may be highlighted as the keyboard's choice, as the
+/// pointer would highlight it. Returns its response and whether it was
+/// clicked.
+fn menu_item_response(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    enabled: bool,
+    highlighted: bool,
+) -> (egui::Response, bool) {
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(
         vec2(width, 28.0),
@@ -225,7 +455,7 @@ pub fn menu_item_enabled(
         },
     );
     if ui.is_rect_visible(rect) {
-        if response.hovered() && enabled {
+        if (response.hovered() || highlighted) && enabled {
             ui.painter()
                 .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
         }
@@ -264,17 +494,155 @@ pub fn menu_item_enabled(
             .galley(crate::bidi::galley_pos(text_rect, &galley), galley, color);
     }
     response.widget_info(|| {
-        egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled && ui.is_enabled(), label)
+        let mut info =
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled && ui.is_enabled(), label);
+        if highlighted {
+            info.selected = Some(true);
+        }
+        info
     });
     theme::focus_ring(ui, &response);
+    if enabled {
+        crate::autoscroll::row(ui, &response);
+    }
     let clicked = enabled && response.clicked();
     if clicked {
         ui.close();
     }
-    if enabled {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    (response, clicked)
+}
+
+/// One entry in a popup menu that opens a child submenu.
+pub fn menu_submenu<R>(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> Option<egui::InnerResponse<R>> {
+    submenu(ui, palette, icon, label, None, add_contents)
+}
+
+/// A submenu that holds a field to type in. A click inside it focuses the
+/// field or scrolls its list instead of closing the menu; its entries still
+/// close the menu when chosen.
+fn menu_submenu_with_field<R>(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> Option<egui::InnerResponse<R>> {
+    submenu(
+        ui,
+        palette,
+        icon,
+        label,
+        Some(egui::PopupCloseBehavior::CloseOnClickOutside),
+        add_contents,
+    )
+}
+
+fn submenu<R>(
+    ui: &mut Ui,
+    palette: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    close_behavior: Option<egui::PopupCloseBehavior>,
+    add_contents: impl FnOnce(&mut Ui) -> R,
+) -> Option<egui::InnerResponse<R>> {
+    let width = ui.available_width();
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 28.0), Sense::click());
+    let is_in_menu = egui::menu::is_in_menu(ui);
+    let submenu_id = egui::menu::SubMenu::id_from_widget_id(response.id);
+    let is_open = if is_in_menu {
+        egui::menu::MenuState::from_ui(ui, |state, _| state.open_item == Some(submenu_id))
+    } else {
+        egui::Popup::menu(&response).is_open()
+    };
+
+    if ui.is_rect_visible(rect) {
+        if response.hovered() || is_open {
+            ui.painter()
+                .rect_filled(rect, CornerRadius::same(6), palette.surface_hover);
+        }
+        let color = palette.text;
+        let mut x = rect.left() + 10.0;
+        if let Some(icon) = icon {
+            let icon_rect =
+                Rect::from_center_size(pos2(x + 8.0, rect.center().y), Vec2::splat(16.0));
+            icon.image(palette.secondary, 16.0).paint_at(ui, icon_rect);
+            x += 26.0;
+        }
+
+        let arrow_galley = crate::bidi::layout(
+            ui.painter(),
+            egui::menu::SubMenuButton::RIGHT_ARROW,
+            theme::regular(11.0),
+            palette.secondary,
+            16.0,
+            1,
+            None,
+        );
+        let arrow_width = arrow_galley.size().x;
+        let arrow_rect = Rect::from_min_max(
+            pos2(
+                rect.right() - 10.0 - arrow_width,
+                rect.center().y - arrow_galley.size().y / 2.0,
+            ),
+            pos2(
+                rect.right() - 10.0,
+                rect.center().y + arrow_galley.size().y / 2.0,
+            ),
+        );
+        ui.painter().galley(
+            crate::bidi::galley_pos(arrow_rect, &arrow_galley),
+            arrow_galley,
+            palette.secondary,
+        );
+
+        let max_text_width = (rect.right() - 10.0 - arrow_width - 6.0 - x).max(0.0);
+        let galley = crate::bidi::layout(
+            ui.painter(),
+            label,
+            theme::regular(13.5),
+            color,
+            max_text_width,
+            1,
+            Some(crate::bidi::ELLIPSIS),
+        );
+        let text_rect = Rect::from_min_max(
+            pos2(x, rect.center().y - galley.size().y / 2.0),
+            pos2(
+                rect.right() - 10.0 - arrow_width - 6.0,
+                rect.center().y + galley.size().y / 2.0,
+            ),
+        );
+        ui.painter()
+            .galley(crate::bidi::galley_pos(text_rect, &galley), galley, color);
     }
-    clicked
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label)
+    });
+    theme::focus_ring(ui, &response);
+    let mut config = egui::menu::MenuConfig::find(ui);
+    if let Some(close_behavior) = close_behavior {
+        config = config.close_behavior(close_behavior);
+    }
+    if is_in_menu {
+        egui::menu::SubMenu::new()
+            .config(config)
+            .show(ui, &response, add_contents)
+    } else {
+        egui::Popup::menu(&response)
+            .close_behavior(config.close_behavior)
+            .style(config.style.clone())
+            .info(
+                egui::UiStackInfo::new(egui::UiKind::Menu)
+                    .with_tag_value(egui::menu::MenuConfig::MENU_CONFIG_TAG, config),
+            )
+            .show(add_contents)
+    }
 }
 
 pub fn menu_separator(ui: &mut Ui, palette: &Palette) {
@@ -304,8 +672,15 @@ pub fn menu_frame(palette: &Palette) -> egui::Frame {
 /// Context menu for actions on selected tracks.
 ///
 /// Tracks stay in table order rather than selection order.
-pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[PlayableItem]) {
+pub fn picked_menu(
+    ui: &mut Ui,
+    app: &mut App,
+    songs: &[PlayableItem],
+    positions: &[u32],
+    editable_playlist: Option<&(String, Option<String>)>,
+) {
     let palette = app.palette;
+    let locale = app.locale;
     ui.set_min_width(220.0);
     ui.set_max_width(300.0);
     let count = songs.len();
@@ -314,14 +689,39 @@ pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[PlayableItem]) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
         ui.label(
-            egui::RichText::new(format!("{count} songs"))
-                .font(theme::medium(12.0))
-                .color(palette.secondary),
+            egui::RichText::new(
+                ngettext(
+                    locale,
+                    // Translators: Keep {count} exactly as written. It becomes the number of selected songs.
+                    "{count} song",
+                    "{count} songs",
+                    count as u32,
+                )
+                .replace("{count}", &count.to_string()),
+            )
+            .font(theme::medium(12.0))
+            .color(palette.secondary),
         );
     });
     ui.add_space(4.0);
     menu_separator(ui, &palette);
-    if menu_item(ui, &palette, Some(Icon::ListEnd), "Add to queue") {
+    if menu_item_enabled(
+        ui,
+        &palette,
+        Some(Icon::SkipForward),
+        &gettext(locale, "Play next"),
+        app.queue_locally_reorderable(),
+    ) {
+        app.actions.push(Action::PlayNext {
+            items: songs.to_vec(),
+        });
+    }
+    if menu_item(
+        ui,
+        &palette,
+        Some(Icon::ListEnd),
+        &gettext(locale, "Add to queue"),
+    ) {
         app.actions.push(Action::QueueMany {
             songs: songs
                 .iter()
@@ -332,14 +732,34 @@ pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[PlayableItem]) {
     // Set one explicit saved state for the full selection.
     let all_saved = uris.iter().all(|uri| app.is_saved(uri).unwrap_or(false));
     let (icon, text) = if all_saved {
-        (Icon::HeartFilled, "Remove from Liked Songs")
+        (
+            Icon::HeartFilled,
+            gettext(locale, "Remove from Liked Songs"),
+        )
     } else {
-        (Icon::Heart, "Save to Liked Songs")
+        (Icon::Heart, gettext(locale, "Save to Liked Songs"))
     };
-    if menu_item(ui, &palette, Some(icon), text) {
+    if menu_item(ui, &palette, Some(icon), &text) {
         app.actions.push(Action::SetSavedMany {
             uris: uris.clone(),
             saved: !all_saved,
+        });
+    }
+    // One entry covers the whole selection on both the unsorted context and
+    // a sorted or filtered view. The caller only passes a playlist when
+    // every picked row shares it.
+    if let Some((playlist_id, _)) = editable_playlist
+        && menu_item(
+            ui,
+            &palette,
+            Some(Icon::Minus),
+            &gettext(locale, "Remove from this playlist"),
+        )
+    {
+        app.actions.push(Action::RemoveFromPlaylist {
+            playlist_id: playlist_id.clone(),
+            uris: uris.clone(),
+            positions: positions.to_vec(),
         });
     }
     add_to_playlist_menu(ui, app, songs);
@@ -347,20 +767,27 @@ pub fn picked_menu(ui: &mut Ui, app: &mut App, songs: &[PlayableItem]) {
 
 fn add_to_playlist_menu(ui: &mut Ui, app: &mut App, items: &[PlayableItem]) {
     let query_id = ui.make_persistent_id("add-to-playlist-query");
-    let opened = ui.menu_button("Add to playlist", |ui| {
-        let frame = ui.ctx().cumulative_frame_nr();
-        let previous = ui
-            .data(|data| data.get_temp::<(u64, String)>(query_id))
-            .filter(|(last_frame, _)| frame.saturating_sub(*last_frame) <= 1);
-        let fresh = previous.is_none();
-        let mut query = previous.map(|(_, query)| query).unwrap_or_default();
-        let field = playlist_picker(ui, app, items, &mut query);
-        if fresh {
-            field.request_focus();
-        }
-        ui.data_mut(|data| data.insert_temp(query_id, (frame, query)));
-    });
-    if opened.inner.is_none() {
+    let palette = app.palette;
+    let opened = menu_submenu_with_field(
+        ui,
+        &palette,
+        Some(Icon::ListPlus),
+        &gettext(app.locale, "Add to playlist"),
+        |ui| {
+            let frame = ui.ctx().cumulative_frame_nr();
+            let previous = ui
+                .data(|data| data.get_temp::<(u64, String)>(query_id))
+                .filter(|(last_frame, _)| frame.saturating_sub(*last_frame) <= 1);
+            let fresh = previous.is_none();
+            let mut query = previous.map(|(_, query)| query).unwrap_or_default();
+            let field = playlist_picker(ui, app, items, &mut query);
+            if fresh {
+                field.request_focus();
+            }
+            ui.data_mut(|data| data.insert_temp(query_id, (frame, query)));
+        },
+    );
+    if opened.is_none() {
         ui.data_mut(|data| data.remove::<(u64, String)>(query_id));
     }
 }
@@ -374,19 +801,75 @@ pub(crate) fn playlist_picker(
     query: &mut String,
 ) -> egui::Response {
     let palette = app.palette;
+    let locale = app.locale;
     ui.set_min_width(220.0);
     ui.set_max_width(300.0);
     let width = ui.available_width();
+    let field_id = ui.make_persistent_id("playlist-filter");
+    let highlight_id = ui.make_persistent_id("playlist-highlight");
+    let playlists = app.editable_playlists();
+    let matching = |query: &str| {
+        let needle = query.trim().to_lowercase();
+        playlists
+            .iter()
+            .filter(move |(_, name)| name.to_lowercase().contains(&needle))
+            .count()
+    };
+    // The keyboard's choice among the matches, for the filter it was made
+    // under. Typing chooses the first match; Up and Down move the choice
+    // and Enter adds to it. The keys are taken before the field sees them.
+    // Like the filter itself, the choice lasts while the menu is drawn.
+    let frame = ui.ctx().cumulative_frame_nr();
+    let (mut highlighted, chosen_for) = ui
+        .data(|data| data.get_temp::<(u64, Option<usize>, String)>(highlight_id))
+        .filter(|(last_frame, _, _)| frame.saturating_sub(*last_frame) <= 1)
+        .map(|(_, highlighted, query)| (highlighted, query))
+        .unwrap_or_default();
+    let mut moved = false;
+    let mut enter = false;
+    if ui.memory(|memory| memory.has_focus(field_id)) {
+        let count = matching(query);
+        let (down, up, pressed) = ui.input_mut(|input| {
+            (
+                input.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown),
+                input.count_and_consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp),
+                highlighted.is_some_and(|index| index < count)
+                    && input.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
+            )
+        });
+        enter = pressed;
+        if count > 0 && down + up > 0 {
+            moved = true;
+            let last = count - 1;
+            let mut index = highlighted.map(|index| index.min(last));
+            for _ in 0..down {
+                index = Some(index.map_or(0, |index| (index + 1).min(last)));
+            }
+            for _ in 0..up {
+                index = Some(index.map_or(last, |index| index.saturating_sub(1)));
+            }
+            highlighted = index;
+        }
+    }
     let field = search_field(
         ui,
         &palette,
-        ui.make_persistent_id("playlist-filter"),
+        locale,
+        field_id,
         query,
-        "Filter playlists",
+        &gettext(locale, "Filter playlists"),
         width,
     );
+    if *query != chosen_for {
+        highlighted = (!query.trim().is_empty()).then_some(0);
+    }
     ui.add_space(4.0);
-    if menu_item(ui, &palette, Some(Icon::Plus), "New playlist") {
+    if menu_item(
+        ui,
+        &palette,
+        Some(Icon::Plus),
+        &gettext(locale, "New playlist"),
+    ) {
         app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
             name: String::new(),
             public: false,
@@ -395,29 +878,52 @@ pub(crate) fn playlist_picker(
     }
     menu_separator(ui, &palette);
     let needle = query.trim().to_lowercase();
-    let playlists = app.editable_playlists();
     let matches: Vec<_> = playlists
         .iter()
         .filter(|(_, name)| name.to_lowercase().contains(&needle))
         .collect();
+    highlighted = highlighted.filter(|index| *index < matches.len());
+    ui.data_mut(|data| data.insert_temp(highlight_id, (frame, highlighted, query.clone())));
+    if enter && let Some((id, name)) = highlighted.and_then(|index| matches.get(index)) {
+        app.actions.push(Action::AddToPlaylist {
+            playlist_id: id.clone(),
+            playlist_name: name.clone(),
+            items: items.to_vec(),
+        });
+        ui.close();
+    }
     if matches.is_empty() {
         theme::subtle(
             ui,
             &palette,
-            if needle.is_empty() {
-                "No editable playlists"
+            &if needle.is_empty() {
+                gettext(locale, "No editable playlists")
             } else {
-                "No matching playlists"
+                gettext(locale, "No matching playlists")
             },
         );
     }
-    egui::ScrollArea::vertical()
-        .id_salt("filtered-playlists")
-        .max_height(320.0)
-        .show(ui, |ui| {
-            for (id, name) in matches {
+    // The popup lays out within last frame's size, so a list a filter has
+    // shrunk would stay that short once the filter is cleared. Asking for
+    // the full height lets it grow back; it still shrinks to fit its rows.
+    let list_height = 320.0;
+    crate::autoscroll::show(
+        ui,
+        egui::ScrollArea::vertical()
+            .id_salt("filtered-playlists")
+            .max_height(list_height)
+            .min_scrolled_height(list_height),
+        egui::Vec2b::new(false, true),
+        |ui| {
+            for (index, (id, name)) in matches.into_iter().enumerate() {
                 ui.push_id(id, |ui| {
-                    if menu_item(ui, &palette, Some(Icon::ListMusic), name) {
+                    let chosen = highlighted == Some(index);
+                    let (row, clicked) =
+                        menu_item_response(ui, &palette, Some(Icon::ListMusic), name, true, chosen);
+                    if chosen && moved {
+                        row.scroll_to_me(None);
+                    }
+                    if clicked {
                         app.actions.push(Action::AddToPlaylist {
                             playlist_id: id.clone(),
                             playlist_name: name.clone(),
@@ -426,7 +932,8 @@ pub(crate) fn playlist_picker(
                     }
                 });
             }
-        });
+        },
+    );
     field
 }
 
@@ -437,45 +944,120 @@ pub fn item_menu(
     context: Option<&RowContext>,
     index: Option<usize>,
 ) {
+    item_menu_at(ui, app, item, context, index, None);
+}
+
+/// [`item_menu`] for a playlist row at `position`, so removing it removes
+/// that copy of a song the list holds more than once.
+fn item_menu_at(
+    ui: &mut Ui,
+    app: &mut App,
+    item: &PlayableItem,
+    context: Option<&RowContext>,
+    index: Option<usize>,
+    position: Option<u32>,
+) {
     let palette = app.palette;
+    let locale = app.locale;
     ui.set_min_width(220.0);
     ui.set_max_width(300.0);
     let uri = item.uri().to_string();
     let label = item.name().to_string();
-    if menu_item(ui, &palette, Some(Icon::ListEnd), "Add to queue") {
+    if menu_item_enabled(
+        ui,
+        &palette,
+        Some(Icon::SkipForward),
+        &gettext(locale, "Play next"),
+        app.queue_locally_reorderable(),
+    ) {
+        app.actions.push(Action::PlayNext {
+            items: vec![item.clone()],
+        });
+    }
+    if menu_item(
+        ui,
+        &palette,
+        Some(Icon::ListEnd),
+        &gettext(locale, "Add to queue"),
+    ) {
         app.actions.push(Action::AddToQueue {
             uri: uri.clone(),
             label: label.clone(),
         });
     }
+    // Only a song the user queued, and only on this computer's queue: the
+    // context's rows play themselves, and no other queue can be rewritten.
+    if let (Some(RowContext::Queue), Some(index)) = (context, index)
+        && app.can_remove_from_queue(index)
+        && menu_item(
+            ui,
+            &palette,
+            Some(Icon::Minus),
+            &gettext(locale, "Remove from queue"),
+        )
+    {
+        app.actions.push(Action::RemoveFromQueue {
+            rows: vec![(index, uri.clone())],
+        });
+    }
     if item.is_track() {
         let saved = app.is_saved(&uri).unwrap_or(false);
         let (icon, text) = if saved {
-            (Icon::HeartFilled, "Remove from Liked Songs")
+            (
+                Icon::HeartFilled,
+                gettext(locale, "Remove from Liked Songs"),
+            )
         } else {
-            (Icon::Heart, "Save to Liked Songs")
+            (Icon::Heart, gettext(locale, "Save to Liked Songs"))
         };
-        if menu_item(ui, &palette, Some(icon), text) {
+        if menu_item(ui, &palette, Some(icon), &text) {
             app.actions.push(Action::ToggleSaved(uri.clone()));
         }
         add_to_playlist_menu(ui, app, std::slice::from_ref(item));
-    } else if menu_item(ui, &palette, Some(Icon::Bookmark), "Save episode") {
+    } else if menu_item(
+        ui,
+        &palette,
+        Some(Icon::Bookmark),
+        &gettext(locale, "Save episode"),
+    ) {
         app.actions.push(Action::ToggleSaved(uri.clone()));
     }
-    if let Some(RowContext::Context {
-        editable_playlist: Some((playlist_id, _)),
-        ..
-    }) = context
-    {
-        if let Some(index) = index {
-            if index > 0 && menu_item(ui, &palette, Some(Icon::ChevronUp), "Move up") {
+    // Removal names the row's song and position, so it stays available on
+    // a sorted or filtered view. Moves are positional, so they stay on the unsorted
+    // context only, where screen positions match server positions.
+    let editable = match context {
+        Some(RowContext::Context {
+            editable_playlist: Some((playlist_id, _)),
+            ..
+        }) => Some((playlist_id, true)),
+        Some(RowContext::View {
+            editable_playlist: Some((playlist_id, _)),
+            ..
+        }) => Some((playlist_id, false)),
+        _ => None,
+    };
+    if let Some((playlist_id, can_move)) = editable {
+        if can_move && let Some(index) = index {
+            if index > 0
+                && menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::ChevronUp),
+                    &gettext(locale, "Move up"),
+                )
+            {
                 app.actions.push(Action::MoveInPlaylist {
                     playlist_id: playlist_id.clone(),
                     from: index as u32,
                     to: index as u32 - 1,
                 });
             }
-            if menu_item(ui, &palette, Some(Icon::ChevronDown), "Move down") {
+            if menu_item(
+                ui,
+                &palette,
+                Some(Icon::ChevronDown),
+                &gettext(locale, "Move down"),
+            ) {
                 app.actions.push(Action::MoveInPlaylist {
                     playlist_id: playlist_id.clone(),
                     from: index as u32,
@@ -483,18 +1065,56 @@ pub fn item_menu(
                 });
             }
         }
-        if menu_item(ui, &palette, Some(Icon::Minus), "Remove from this playlist") {
+        if menu_item(
+            ui,
+            &palette,
+            Some(Icon::Minus),
+            &gettext(locale, "Remove from this playlist"),
+        ) {
             app.actions.push(Action::RemoveFromPlaylist {
                 playlist_id: playlist_id.clone(),
                 uris: vec![uri.clone()],
+                positions: position.into_iter().collect(),
+            });
+        }
+    }
+    // Spotify's own mixes hide a song for this listener without removing
+    // it from anyone's copy (#779).
+    let hide_in = match context {
+        Some(RowContext::Context { uri, .. }) => Some(uri),
+        Some(RowContext::View { context_uri, .. }) => Some(context_uri),
+        _ => None,
+    }
+    .filter(|playlist| item.is_track() && app.can_hide_in(playlist))
+    .cloned();
+    if let Some(playlist_uri) = hide_in {
+        let hidden = app.hidden_in(&playlist_uri, &uri);
+        let (icon, text) = if hidden {
+            (Icon::Eye, gettext(locale, "Show in this playlist"))
+        } else {
+            (Icon::EyeOff, gettext(locale, "Hide in this playlist"))
+        };
+        if menu_item(ui, &palette, Some(icon), &text) {
+            app.actions.push(Action::SetHiddenInPlaylist {
+                playlist_uri,
+                track_uri: uri.clone(),
+                hidden: !hidden,
             });
         }
     }
     menu_separator(ui, &palette);
     match item {
         PlayableItem::Track(track) => {
-            if menu_item(ui, &palette, Some(Icon::Radio), "Go to song radio") {
-                app.actions.push(Action::PlayTrackRadio(uri.clone()));
+            if menu_item(
+                ui,
+                &palette,
+                Some(Icon::Radio),
+                &gettext(locale, "Go to song radio"),
+            ) {
+                app.actions.push(Action::OpenSongRadio {
+                    uri: uri.clone(),
+                    track: Box::new(track.clone()),
+                });
             }
             let artists: Vec<&ArtistRef> = track
                 .artists
@@ -502,13 +1122,19 @@ pub fn item_menu(
                 .filter(|artist| artist.id.is_some())
                 .collect();
             if artists.len() == 1 {
-                if menu_item(ui, &palette, Some(Icon::User), "Go to artist") {
+                if menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::User),
+                    &gettext(locale, "Go to artist"),
+                ) {
                     app.actions.push(Action::Open(Page::Artist(
                         artists[0].id.clone().unwrap_or_default(),
                     )));
                 }
             } else if artists.len() > 1 {
-                ui.menu_button("Go to artist", |ui| {
+                let label = gettext(locale, "Go to artist");
+                menu_submenu(ui, &palette, Some(Icon::User), &label, |ui| {
                     ui.set_min_width(200.0);
                     for artist in &artists {
                         if menu_item(ui, &palette, Some(Icon::User), &artist.name) {
@@ -521,7 +1147,12 @@ pub fn item_menu(
             }
             if let Some(album) = &track.album
                 && !album.id.is_empty()
-                && menu_item(ui, &palette, Some(Icon::Disc), "Go to album")
+                && menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::Disc),
+                    &gettext(locale, "Go to album"),
+                )
             {
                 app.actions
                     .push(Action::Open(Page::Album(album.id.clone())));
@@ -529,17 +1160,32 @@ pub fn item_menu(
         }
         PlayableItem::Episode(episode) => {
             if let Some(show) = &episode.show
-                && menu_item(ui, &palette, Some(Icon::Mic), "Go to podcast")
+                && menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::Mic),
+                    &gettext(locale, "Go to podcast"),
+                )
             {
                 app.actions.push(Action::Open(Page::Show(show.id.clone())));
             }
         }
     }
     menu_separator(ui, &palette);
-    if menu_item(ui, &palette, Some(Icon::Copy), "Copy link") {
+    if menu_item(
+        ui,
+        &palette,
+        Some(Icon::Copy),
+        &gettext(locale, "Copy link"),
+    ) {
         app.actions.push(Action::CopyLink(uri.clone()));
     }
-    if menu_item(ui, &palette, Some(Icon::ExternalLink), "Open in Spotify") {
+    if menu_item(
+        ui,
+        &palette,
+        Some(Icon::ExternalLink),
+        &gettext(locale, "Open in Spotify"),
+    ) {
         app.actions.push(Action::OpenInSpotify(uri));
     }
 }
@@ -553,20 +1199,35 @@ pub fn context_menu_items(
     owned_playlist: Option<&Playlist>,
 ) {
     let palette = app.palette;
+    let locale = app.locale;
     ui.set_min_width(200.0);
     ui.set_max_width(300.0);
     let kind = util::uri_kind(uri).unwrap_or("");
-    if menu_item(ui, &palette, Some(Icon::Play), "Play") {
+    if menu_item(ui, &palette, Some(Icon::Play), &gettext(locale, "Play")) {
         app.actions.push(Action::PlayContext {
             uri: uri.to_string(),
             offset_uri: None,
             offset_index: None,
         });
     }
-    if kind != "artist" && menu_item(ui, &palette, Some(Icon::Shuffle), "Shuffle play") {
+    if kind != "artist"
+        && menu_item(
+            ui,
+            &palette,
+            Some(Icon::Shuffle),
+            &gettext(locale, "Shuffle play"),
+        )
+    {
         app.actions.push(Action::ShufflePlay(uri.to_string()));
     }
-    if kind == "album" && menu_item(ui, &palette, Some(Icon::ListEnd), "Add to queue") {
+    if kind == "album"
+        && menu_item(
+            ui,
+            &palette,
+            Some(Icon::ListEnd),
+            &gettext(locale, "Add to queue"),
+        )
+    {
         app.actions.push(Action::AddToQueue {
             uri: uri.to_string(),
             label: name.to_string(),
@@ -574,17 +1235,23 @@ pub fn context_menu_items(
     }
     let saved = app.is_saved(uri).unwrap_or(false);
     let (icon, text) = match (kind, saved) {
-        ("artist", true) => (Icon::CircleX, "Unfollow"),
-        ("artist", false) => (Icon::CirclePlus, "Follow"),
-        (_, true) => (Icon::CircleX, "Remove from Your Library"),
-        (_, false) => (Icon::CirclePlus, "Add to Your Library"),
+        ("artist", true) => (Icon::CircleX, pgettext(locale, "artist", "Unfollow")),
+        ("artist", false) => (Icon::CirclePlus, pgettext(locale, "artist", "Follow")),
+        (_, true) => (Icon::CircleX, gettext(locale, "Remove from Your Library")),
+        (_, false) => (Icon::CirclePlus, gettext(locale, "Add to Your Library")),
     };
-    if owned_playlist.is_none() && menu_item(ui, &palette, Some(icon), text) {
+    if owned_playlist.is_none() && menu_item(ui, &palette, Some(icon), &text) {
         app.actions.push(Action::ToggleSaved(uri.to_string()));
     }
     if let Some(playlist) = owned_playlist {
-        if menu_item(ui, &palette, Some(Icon::Pencil), "Edit details") {
+        if menu_item(
+            ui,
+            &palette,
+            Some(Icon::Pencil),
+            &gettext(locale, "Edit details"),
+        ) {
             app.actions.push(Action::ShowDialog(Dialog::EditPlaylist {
+                cover: Default::default(),
                 id: playlist.id.clone(),
                 name: playlist.name.clone(),
                 description: playlist
@@ -592,10 +1259,10 @@ pub fn context_menu_items(
                     .clone()
                     .map(|d| util::strip_html(&d))
                     .unwrap_or_default(),
-                public: playlist.public.unwrap_or(false),
+                public: playlist.public,
             }));
         }
-        if menu_item(ui, &palette, Some(Icon::Trash), "Delete") {
+        if menu_item(ui, &palette, Some(Icon::Trash), &gettext(locale, "Delete")) {
             app.actions
                 .push(Action::ShowDialog(Dialog::ConfirmDeletePlaylist {
                     id: playlist.id.clone(),
@@ -605,12 +1272,43 @@ pub fn context_menu_items(
         }
     }
     menu_separator(ui, &palette);
-    if menu_item(ui, &palette, Some(Icon::Copy), "Copy link") {
+    let radio = match kind {
+        "playlist" => Some(gettext(locale, "Go to playlist radio")),
+        "album" => Some(gettext(locale, "Go to album radio")),
+        "artist" => Some(gettext(locale, "Go to artist radio")),
+        _ => None,
+    };
+    if let Some(label) = radio
+        && util::station_uri(uri).is_some()
+        && menu_item(ui, &palette, Some(Icon::Radio), &label)
+    {
+        app.actions.push(Action::Open(Page::Radio(uri.to_string())));
+    }
+    if menu_item(
+        ui,
+        &palette,
+        Some(Icon::Copy),
+        &gettext(locale, "Copy link"),
+    ) {
         app.actions.push(Action::CopyLink(uri.to_string()));
     }
-    if menu_item(ui, &palette, Some(Icon::ExternalLink), "Open in Spotify") {
+    if menu_item(
+        ui,
+        &palette,
+        Some(Icon::ExternalLink),
+        &gettext(locale, "Open in Spotify"),
+    ) {
         app.actions.push(Action::OpenInSpotify(uri.to_string()));
     }
+}
+
+/// Whether a row can start playback through Spotify. Unknown availability
+/// remains playable, while local files and missing entries cannot be requested.
+pub(crate) fn row_playable(item: &PlayableItem) -> bool {
+    !item.uri().is_empty()
+        && !item.uri().starts_with("spotify:local:")
+        && !matches!(item, PlayableItem::Track(track)
+            if track.is_local || track.is_playable == Some(false))
 }
 
 /// Describes one row of a track table.
@@ -625,6 +1323,9 @@ pub struct TrackRow<'a> {
     /// Who put the song here, on playlists made together.
     pub added_by: Option<&'a str>,
     pub show_added_by: bool,
+    /// Spotify's play count for the song, on album pages and an artist's
+    /// popular songs once the counts arrived.
+    pub show_plays: bool,
     pub compact: bool,
     /// One line for the name and the artists in a shorter row without the
     /// cover: the compact track list. `compact` stays the queue's narrow row.
@@ -638,6 +1339,11 @@ pub struct TrackRow<'a> {
     /// the menu can update a destination playlist before Spotify answers.
     /// Empty where a list does not offer picking.
     pub picked_songs: &'a [PlayableItem],
+    /// The playlist position of each of `picked_songs`, when the list is a
+    /// playlist that knows them; empty otherwise.
+    pub picked_positions: &'a [u32],
+    /// This row's position in its playlist, whatever the view's order.
+    pub position: Option<u32>,
 }
 
 /// Draw each credited artist separately so its Spotify id remains clickable.
@@ -647,22 +1353,31 @@ pub(crate) fn artist_links(
     artists: &[ArtistRef],
     font: egui::FontId,
     color: Color32,
-) {
+) -> bool {
     let spacing = ui.spacing().item_spacing;
+    let mut clicked = false;
     ui.spacing_mut().item_spacing.x = 0.0;
     for (index, artist) in artists.iter().enumerate() {
         if index > 0 {
             theme::text(ui, ", ", font.clone(), color);
         }
+        // egui advances the cursor with the spacing of the widget just
+        // drawn. The final artist needs the surrounding gap before the
+        // next metadata separator, while commas between artists stay snug.
+        if index + 1 == artists.len() {
+            ui.spacing_mut().item_spacing = spacing;
+        }
         if let Some(id) = &artist.id {
             if theme::link(ui, &artist.name, font.clone(), color).clicked() {
                 app.actions.push(Action::Open(Page::Artist(id.clone())));
+                clicked = true;
             }
         } else {
             theme::text(ui, &artist.name, font.clone(), color);
         }
     }
     ui.spacing_mut().item_spacing = spacing;
+    clicked
 }
 
 /// Column widths of the track table, computed from the available width.
@@ -672,9 +1387,18 @@ struct Columns {
     album: f32,
     added_by: f32,
     added: f32,
+    plays: f32,
     heart: f32,
     duration: f32,
     more: f32,
+}
+
+/// The play count column's width, in rows and in the header alike.
+const PLAYS_WIDTH: f32 = 120.0;
+
+/// Whether a list `width` wide has room for play counts.
+fn plays_fit(width: f32) -> bool {
+    width > 560.0
 }
 
 fn columns(width: f32, row: &TrackRow<'_>) -> Columns {
@@ -703,6 +1427,11 @@ fn columns(width: f32, row: &TrackRow<'_>) -> Columns {
         } else {
             0.0
         },
+        plays: if row.show_plays && !row.compact && plays_fit(width) {
+            PLAYS_WIDTH
+        } else {
+            0.0
+        },
         heart: if row.compact { 0.0 } else { 36.0 },
         duration: if row.compact { 44.0 } else { 56.0 },
         more: if row.compact { 0.0 } else { 36.0 },
@@ -714,6 +1443,15 @@ fn columns(width: f32, row: &TrackRow<'_>) -> Columns {
 /// Returns the selection behavior for a row-body click. The caller supplies
 /// the display index because sorting and filtering change row positions.
 pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPick> {
+    track_row_response(ui, app, row).1
+}
+
+/// Also exposes the row body so a collection can navigate between whole songs.
+pub(crate) fn track_row_response(
+    ui: &mut Ui,
+    app: &mut App,
+    row: TrackRow<'_>,
+) -> (egui::Response, Option<RowPick>) {
     // Virtual lists reuse the visible slots as they scroll. Keep focus and
     // accessibility actions attached to the song and its occurrence instead.
     // Now playing and Next up can both contain the same song at index zero.
@@ -722,7 +1460,11 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
         "track-row",
         std::mem::discriminant(row.context),
         row.item.uri(),
-        row.index,
+        // Playback can omit unavailable rows; the displayed occurrence keeps
+        // a distinct identity even when playback positions are compacted.
+        row.number
+            .map(|number| number.saturating_sub(1))
+            .unwrap_or(row.index),
     ));
     ui.scope_builder(UiBuilder::new().id(id), |ui| {
         track_row_contents(ui, app, row)
@@ -730,7 +1472,11 @@ pub fn track_row(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPic
     .inner
 }
 
-fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<RowPick> {
+fn track_row_contents(
+    ui: &mut Ui,
+    app: &mut App,
+    row: TrackRow<'_>,
+) -> (egui::Response, Option<RowPick>) {
     let palette = app.palette;
     let row_height = if row.thin {
         theme::THIN_ROW_HEIGHT
@@ -742,63 +1488,90 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(vec2(width, row_height), Sense::click_and_drag());
     let rect = rect.translate(vec2(0.0, row.shift));
-    let unavailable = match row.item {
-        PlayableItem::Track(track) => track.is_playable == Some(false) || track.is_local,
-        PlayableItem::Episode(_) => false,
-    };
+    let unavailable = !app.row_playable(row.item);
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::Button,
             ui.is_enabled() && !unavailable,
             row.picked,
-            format!("Play {}, {}", row.item.name(), row.item.subtitle()),
+            gettext(
+                app.locale,
+                // Translators: {title} is a song or episode name, {subtitle} its artists or podcast.
+                "Play {title}, {subtitle}",
+            )
+            .replace("{title}", row.item.name())
+            .replace("{subtitle}", &row.item.subtitle()),
         )
     });
     if response.gained_focus() {
         response.scroll_to_me(None);
     }
     if !ui.is_rect_visible(rect) && !response.has_focus() && !response.clicked() {
-        return None;
+        return (response, None);
     }
     // Start a sidebar drag only after egui's drag threshold.
-    if row.item.is_track() && response.drag_started_by(egui::PointerButton::Primary) {
-        // Keep the source index for moves within an editable playlist.
-        let from = match row.context {
+    if ui.is_enabled()
+        && row.item.is_track()
+        && response.drag_started_by(egui::PointerButton::Primary)
+    {
+        let items = dragged_items(row.item, row.picked, row.picked_songs);
+        let source_playlist = match row.context {
             RowContext::Context {
                 editable_playlist: Some((id, _)),
                 ..
-            } => Some((id.clone(), row.index as u32)),
+            } => Some(id.clone()),
             _ => None,
         };
+        // Keep the source index for moves within an editable playlist, or
+        // within the manually queued section while it can be rewritten.
+        let from = (items.len() == 1)
+            .then(|| match row.context {
+                RowContext::Context {
+                    editable_playlist: Some((id, _)),
+                    ..
+                } => Some((id.clone(), row.index as u32)),
+                RowContext::Queue
+                    if row.index < app.queued_rows_len() && app.queue_locally_reorderable() =>
+                {
+                    Some(("queue".to_string(), row.index as u32))
+                }
+                _ => None,
+            })
+            .flatten();
+        let preview = items.first().unwrap_or(row.item);
         egui::DragAndDrop::set_payload(
             ui.ctx(),
             DragTrack {
-                uri: row.item.uri().to_string(),
-                title: row.item.name().to_string(),
-                image: row.item.image(64).map(str::to_string),
-                item: row.item.clone(),
+                title: preview.name().to_string(),
+                image: preview.image(64).map(str::to_string),
+                items,
                 from,
+                source_playlist,
             },
         );
     }
     // A queue row is a position, not the song itself: the same song can
     // sit in the queue while it plays (a repeat wrapping around, a song
     // queued twice), and only the Now playing row is the playing one.
+    // A song started from one of its copies in this list marks that copy
+    // alone: the others are other places in the list.
+    let played_copy = app.row_is_played_copy(row.context, row.index, row.item.uri());
     let is_current = !matches!(row.context, RowContext::Queue)
+        && played_copy
         && app
             .current_track_uri()
             .is_some_and(|uri| uri == row.item.uri());
+    let pending = played_copy && app.play_pending(row.item.uri());
     let playing = is_current && app.believed_playing();
-    let hovered = ui.rect_contains_pointer(rect) || response.has_focus();
+    let hovered = ui.is_enabled() && (ui.rect_contains_pointer(rect) || response.has_focus());
     if row.picked {
-        // Picked rows read as a block, so a run of them looks like one
-        // thing rather than a stack of hovers. Hovering one still lifts
-        // it, so the pointer is never lost inside the block.
+        // Keep the existing translucent selection, using a neutral palette
+        // color so selecting a song does not mark it as playing.
         ui.painter().rect_filled(
             rect,
             CornerRadius::same(6),
             palette
-                .accent
+                .secondary
                 .gamma_multiply(if hovered { 0.30 } else { 0.20 }),
         );
     } else if hovered {
@@ -810,7 +1583,8 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
                 .gamma_multiply(if palette.dark { 0.7 } else { 1.0 }),
         );
     }
-    theme::focus_ring(ui, &response);
+    // The row highlight also shows keyboard focus. Do not add an outline
+    // when a mouse click gives the row focus for arrow-key navigation.
     let cols = columns(width, &row);
     let painter = ui.painter().clone();
     let mut x = rect.left() + 8.0;
@@ -818,7 +1592,7 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
     // Number / play.
     if cols.number > 0.0 {
         let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.number, row_height));
-        if app.play_pending(row.item.uri()) {
+        if pending {
             let mut child = ui.new_child(
                 UiBuilder::new()
                     .max_rect(cell)
@@ -861,7 +1635,7 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
         paint_cover(
             ui,
             &palette,
-            row.item.image(64),
+            row.item.image(app.art_px(size)),
             cover_rect,
             4.0,
             if row.item.is_track() {
@@ -881,7 +1655,7 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
                     Color32::from_black_alpha(alpha),
                 );
             };
-            if app.play_pending(row.item.uri()) {
+            if pending {
                 scrim(140);
                 let mut child = ui.new_child(
                     UiBuilder::new()
@@ -905,9 +1679,12 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
         x += cols.cover;
     }
     let right_fixed = cols.heart + cols.duration + cols.more + 8.0;
-    let text_right = rect.right() - right_fixed - cols.added - cols.added_by - cols.album;
-    let title_rect =
-        Rect::from_min_max(pos2(x, rect.top()), pos2(text_right - 12.0, rect.bottom()));
+    let text_right =
+        rect.right() - right_fixed - cols.plays - cols.added - cols.added_by - cols.album;
+    let title_rect = Rect::from_min_max(
+        pos2(x, rect.top()),
+        pos2((text_right - 12.0).max(x), rect.bottom()),
+    );
 
     // Title and artists.
     let title_color = if unavailable {
@@ -957,7 +1734,8 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
                 if let Some(added) = row.added_at.filter(|a| !a.starts_with("1970-01-01"))
                     && cols.added == 0.0
                 {
-                    let label = util::format_relative_date(added, jiff::Timestamp::now());
+                    let label =
+                        util::format_relative_date(app.locale, added, jiff::Timestamp::now());
                     theme::text(
                         &mut child,
                         "•",
@@ -1002,7 +1780,8 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
                         theme::regular(12.0),
                         palette.secondary.gamma_multiply(0.6),
                     );
-                    let label = util::format_relative_date(added, jiff::Timestamp::now());
+                    let label =
+                        util::format_relative_date(app.locale, added, jiff::Timestamp::now());
                     theme::text(&mut child, &label, theme::regular(12.0), palette.secondary);
                     if label.ends_with(" ago") {
                         ui.ctx()
@@ -1049,7 +1828,8 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
                             theme::regular(12.0),
                             palette.secondary.gamma_multiply(0.6),
                         );
-                        let label = util::format_relative_date(added, jiff::Timestamp::now());
+                        let label =
+                            util::format_relative_date(app.locale, added, jiff::Timestamp::now());
                         theme::text(ui, &label, theme::regular(12.0), palette.secondary);
                         if label.ends_with(" ago") {
                             ui.ctx()
@@ -1079,7 +1859,8 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
                             theme::regular(12.0),
                             palette.secondary.gamma_multiply(0.6),
                         );
-                        let label = util::format_relative_date(added, jiff::Timestamp::now());
+                        let label =
+                            util::format_relative_date(app.locale, added, jiff::Timestamp::now());
                         theme::text(ui, &label, theme::regular(12.0), palette.secondary);
                         if label.ends_with(" ago") {
                             ui.ctx()
@@ -1149,7 +1930,7 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
             .filter(|added| !added.starts_with("1970-01-01"))
         {
             let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.added, row_height));
-            let label = util::format_relative_date(added, jiff::Timestamp::now());
+            let label = util::format_relative_date(app.locale, added, jiff::Timestamp::now());
             painter.text(
                 pos2(cell.left(), cell.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -1165,6 +1946,20 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
             }
         }
         x += cols.added;
+    }
+    // Plays.
+    if cols.plays > 0.0 {
+        if let Some(plays) = app.play_counts.get(row.item.uri()) {
+            let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(cols.plays, row_height));
+            painter.text(
+                pos2(cell.left(), cell.center().y),
+                egui::Align2::LEFT_CENTER,
+                util::format_count(*plays),
+                theme::regular(13.0),
+                palette.secondary,
+            );
+        }
+        x += cols.plays;
     }
 
     // Heart.
@@ -1183,17 +1978,18 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
             {
                 child.set_opacity(0.0);
             }
-            let (icon, color) = if saved == Some(true) {
-                (Icon::HeartFilled, palette.accent)
+            // A liked heart stays green under the pointer.
+            let (icon, color, hover) = if saved == Some(true) {
+                (Icon::HeartFilled, palette.accent, palette.accent_hover)
             } else {
-                (Icon::Heart, palette.secondary)
+                (Icon::Heart, palette.secondary, palette.text)
             };
             let tooltip = if saved == Some(true) {
-                "Remove from Liked Songs"
+                gettext(app.locale, "Remove from Liked Songs")
             } else {
-                "Save to Liked Songs"
+                gettext(app.locale, "Save to Liked Songs")
             };
-            if theme::icon_button(&mut child, icon, 16.0, color, palette.text, tooltip).clicked() {
+            if theme::icon_button(&mut child, icon, 16.0, color, hover, &tooltip).clicked() {
                 app.actions
                     .push(Action::ToggleSaved(row.item.uri().to_string()));
             }
@@ -1236,24 +2032,33 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
             18.0,
             palette.secondary,
             palette.text,
-            "More",
+            &gettext(app.locale, "More"),
         );
         egui::Popup::menu(&more)
             .id(menu_id)
             .frame(menu_frame(&palette))
-            .show(|ui| item_menu(ui, app, row.item, Some(row.context), Some(row.index)));
+            .show(|ui| {
+                item_menu_at(
+                    ui,
+                    app,
+                    row.item,
+                    Some(row.context),
+                    Some(row.index),
+                    row.position,
+                )
+            });
     }
 
     // Row interactions.
     let mut pick = None;
     let accessible_click = response.clicked() && response.interact_pointer_pos().is_none();
-    if (response.double_clicked() || accessible_click) && !unavailable {
+    if ui.is_enabled() && (response.double_clicked() || accessible_click) && !unavailable {
         app.actions.push(Action::PlayFromRow {
             context: row.context.clone(),
             uri: row.item.uri().to_string(),
             index: row.index as u32,
         });
-    } else if response.clicked() {
+    } else if ui.is_enabled() && response.clicked() {
         // The cell that holds the play control: the number column when
         // there is one, the cover when there is not.
         let control = if cols.number > 0.0 {
@@ -1281,6 +2086,7 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
             }
         } else if !on_control {
             // The body of the row, which plays nothing on a single click.
+            response.request_focus();
             let modifiers = ui.input(|input| input.modifiers);
             pick = Some(if modifiers.shift {
                 RowPick::Range
@@ -1298,12 +2104,34 @@ fn track_row_contents(ui: &mut Ui, app: &mut App, row: TrackRow<'_>) -> Option<R
             // them; on anything else it is the ordinary single-song menu,
             // including a picked row that is the only one picked.
             if row.picked && row.picked_songs.len() > 1 {
-                picked_menu(ui, app, row.picked_songs);
+                // Every picked row shares this table's context, so one
+                // editable playlist covers the whole selection, including
+                // a sorted or filtered view where removal stays URI-based.
+                let editable = match row.context {
+                    RowContext::Context {
+                        editable_playlist: Some(playlist),
+                        ..
+                    }
+                    | RowContext::View {
+                        editable_playlist: Some(playlist),
+                        ..
+                    } => Some(playlist),
+                    _ => None,
+                };
+                picked_menu(ui, app, row.picked_songs, row.picked_positions, editable);
             } else {
-                item_menu(ui, app, row.item, Some(row.context), Some(row.index));
+                item_menu_at(
+                    ui,
+                    app,
+                    row.item,
+                    Some(row.context),
+                    Some(row.index),
+                    row.position,
+                );
             }
         });
-    pick
+    crate::autoscroll::row(ui, &response);
+    (response, pick)
 }
 
 /// Scroll the enclosing list while a held drag approaches its visible edges.
@@ -1337,11 +2165,39 @@ pub(crate) fn scroll_during_drag(ui: &Ui) {
     ui.ctx().request_repaint();
 }
 
+fn dragged_items(
+    item: &PlayableItem,
+    picked: bool,
+    picked_songs: &[PlayableItem],
+) -> Vec<PlayableItem> {
+    if picked && !picked_songs.is_empty() {
+        picked_songs.to_vec()
+    } else {
+        vec![item.clone()]
+    }
+}
+
+fn drag_label(locale: Locale, track: &DragTrack) -> String {
+    match track.items.as_slice() {
+        [] => track.title.clone(),
+        [item] => item.name().to_string(),
+        [first, rest @ ..] => ngettext(
+            locale,
+            // Translators: The label beside the pointer while songs are dragged. {name} is the first song's name and {count} how many more songs are dragged with it.
+            "{name} + {count} more",
+            "{name} + {count} more",
+            rest.len() as u32,
+        )
+        .replace("{name}", first.name())
+        .replace("{count}", &rest.len().to_string()),
+    }
+}
+
 /// The chip that rides the pointer while a song is being dragged.
-pub fn drag_ghost(ctx: &egui::Context, palette: &Palette) {
+pub fn drag_ghost(ctx: &egui::Context, palette: &Palette, locale: Locale) {
     // A song and a sidebar row ride the pointer the same way.
     let chip = egui::DragAndDrop::payload::<DragTrack>(ctx)
-        .map(|track| (track.title.clone(), track.image.clone()))
+        .map(|track| (drag_label(locale, &track), track.image.clone()))
         .or_else(|| {
             egui::DragAndDrop::payload::<DragEntry>(ctx)
                 .map(|entry| (entry.title.clone(), entry.image.clone()))
@@ -1408,13 +2264,17 @@ pub fn explicit_badge(ui: &mut Ui, palette: &Palette) {
 /// The header row above a track table.
 /// The column headings above a track table. Answers with the heading that
 /// was clicked, so the table can sort by it.
-#[expect(clippy::fn_params_excessive_bools)]
+// The column switches and the language are independent inputs of one
+// drawing call; a struct would exist only to carry them here.
+#[expect(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]
 pub fn table_header(
     ui: &mut Ui,
     palette: &Palette,
+    locale: Locale,
     show_album: bool,
     show_added: bool,
     show_added_by: bool,
+    show_plays: bool,
     show_cover: bool,
     sort: Option<crate::model::TableSort>,
 ) -> Option<crate::model::SortColumn> {
@@ -1439,7 +2299,12 @@ pub fn table_header(
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Button,
                 ui.is_enabled(),
-                format!("Sort by {text}"),
+                gettext(
+                    locale,
+                    // Translators: {column} is a column heading of a song list, such as Title.
+                    "Sort by {column}",
+                )
+                .replace("{column}", text),
             )
         });
         theme::focus_ring(ui, &response);
@@ -1470,10 +2335,7 @@ pub fn table_header(
                 egui::Stroke::NONE,
             ));
         }
-        if response
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .clicked()
-        {
+        if response.clicked() {
             clicked = Some(column);
         }
     };
@@ -1490,7 +2352,7 @@ pub fn table_header(
             egui::WidgetInfo::labeled(
                 egui::WidgetType::Button,
                 ui.is_enabled(),
-                "Sort by playlist order",
+                gettext(locale, "Sort by playlist order"),
             )
         });
         theme::focus_ring(ui, &response);
@@ -1525,8 +2387,7 @@ pub fn table_header(
             ));
         }
         if response
-            .on_hover_cursor(egui::CursorIcon::PointingHand)
-            .on_hover_text("Original order, reversed")
+            .on_hover_text(gettext(locale, "Original order, reversed"))
             .clicked()
         {
             number_clicked = true;
@@ -1536,7 +2397,12 @@ pub fn table_header(
     if show_cover {
         x += 52.0;
     }
-    heading(ui, x, "TITLE", SortColumn::Title);
+    heading(
+        ui,
+        x,
+        &pgettext(locale, "column heading", "TITLE"),
+        SortColumn::Title,
+    );
     let medium = width > 560.0;
     let wide = width > 760.0;
     let album_width = if show_album && medium {
@@ -1551,18 +2417,50 @@ pub fn table_header(
     } else {
         0.0
     };
+    let plays_width = if show_plays && plays_fit(width) {
+        PLAYS_WIDTH
+    } else {
+        0.0
+    };
     let right_fixed = 36.0 + 56.0 + 36.0 + 8.0;
-    let mut cx = rect.right() - right_fixed - added_width - added_by_width - album_width;
+    let mut cx =
+        rect.right() - right_fixed - plays_width - added_width - added_by_width - album_width;
     if album_width > 0.0 {
-        heading(ui, cx, "ALBUM", SortColumn::Album);
+        heading(
+            ui,
+            cx,
+            &pgettext(locale, "column heading", "ALBUM"),
+            SortColumn::Album,
+        );
         cx += album_width;
     }
     if added_by_width > 0.0 {
-        heading(ui, cx, "ADDED BY", SortColumn::AddedBy);
+        heading(
+            ui,
+            cx,
+            &pgettext(locale, "column heading", "ADDED BY"),
+            SortColumn::AddedBy,
+        );
         cx += added_by_width;
     }
     if added_width > 0.0 {
-        heading(ui, cx, "DATE ADDED", SortColumn::Added);
+        heading(
+            ui,
+            cx,
+            &pgettext(locale, "column heading", "DATE ADDED"),
+            SortColumn::Added,
+        );
+        cx += added_width;
+    }
+    // Spotify's own lists do not sort by plays, and neither does this one.
+    if plays_width > 0.0 {
+        ui.painter().text(
+            pos2(cx, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            pgettext(locale, "column heading", "PLAYS"),
+            font.clone(),
+            color,
+        );
     }
     if number_clicked {
         clicked = Some(SortColumn::Index);
@@ -1581,7 +2479,7 @@ pub fn table_header(
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             ui.is_enabled(),
-            "Sort by duration",
+            gettext(locale, "Sort by duration"),
         )
     });
     theme::focus_ring(ui, &response);
@@ -1611,8 +2509,7 @@ pub fn table_header(
         ));
     }
     if response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_text("Sort by duration")
+        .on_hover_text(gettext(locale, "Sort by duration"))
         .clicked()
     {
         clicked = Some(SortColumn::Duration);
@@ -1654,13 +2551,43 @@ pub struct CardResponse {
     pub play: bool,
 }
 
+/// The cover a [`card`] shows: its shape and what its play control does.
+#[derive(Clone, Copy, Default)]
+pub struct CardCover {
+    /// A circular cover, as an artist's portrait.
+    pub circular: bool,
+    /// Hover offers a play control; cards that only navigate leave it off.
+    pub playable: bool,
+    /// The card's context is the one playing, so the control pauses.
+    pub playing: bool,
+}
+
+impl CardCover {
+    /// A square cover that plays on hover.
+    pub fn square(playing: bool) -> Self {
+        Self {
+            playable: true,
+            playing,
+            ..Self::default()
+        }
+    }
+
+    /// A circular artist portrait that plays on hover.
+    pub fn portrait(playing: bool) -> Self {
+        Self {
+            circular: true,
+            ..Self::square(playing)
+        }
+    }
+}
+
 /// Fixed height of a [`card`] row for virtualised grids.
 pub fn card_row_height(ui: &mut Ui) -> f32 {
     const PAD: f32 = 12.0;
     const TITLE_GAP: f32 = 10.0;
     const SUBTITLE_GAP: f32 = 2.0;
     const BOTTOM_PAD: f32 = 8.0;
-    let image_size = CARD_WIDTH - 2.0 * PAD;
+    let image_size = CARD_ART;
     let title_font = theme::semibold(14.0);
     let subtitle_font = theme::regular(12.5);
     let (title_row, subtitle_row) = ui.fonts_mut(|fonts| {
@@ -1679,15 +2606,19 @@ pub fn card(
     image: Option<&str>,
     title: &str,
     subtitle: &str,
-    round: bool,
-    playable: bool,
+    cover: CardCover,
 ) -> CardResponse {
+    let CardCover {
+        circular,
+        playable,
+        playing,
+    } = cover;
     let palette = app.palette;
     const PAD: f32 = 12.0;
     const TITLE_GAP: f32 = 10.0;
     const SUBTITLE_GAP: f32 = 2.0;
     const BOTTOM_PAD: f32 = 8.0;
-    let image_size = CARD_WIDTH - 2.0 * PAD;
+    let image_size = CARD_ART;
     let text_width = image_size;
     let title_font = theme::semibold(14.0);
     let subtitle_font = theme::regular(12.5);
@@ -1727,7 +2658,7 @@ pub fn card(
             );
         }
         let image_rect = Rect::from_min_size(rect.min + vec2(PAD, PAD), Vec2::splat(image_size));
-        let radius = if round { image_size / 2.0 } else { 6.0 };
+        let radius = if circular { image_size / 2.0 } else { 6.0 };
         paint_shadow(ui, &palette, image_rect, radius);
         paint_cover(
             ui,
@@ -1735,7 +2666,7 @@ pub fn card(
             image,
             image_rect,
             radius,
-            if round { Icon::User } else { Icon::Music },
+            if circular { Icon::User } else { Icon::Music },
             Some(app.backend.art()),
         );
         let text_left = rect.left() + PAD;
@@ -1782,17 +2713,21 @@ pub fn card(
             );
             play = theme::circle_button(
                 &mut child,
-                Icon::PlayFilled,
+                if playing {
+                    Icon::PauseFilled
+                } else {
+                    Icon::PlayFilled
+                },
                 44.0,
                 palette.accent,
                 palette.accent_hover,
                 palette.on_accent,
-                "Play",
+                &gettext(app.locale, if playing { "Pause" } else { "Play" }),
             )
             .clicked();
         }
     }
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    crate::autoscroll::row(ui, &response);
     theme::focus_ring(ui, &response);
     CardResponse {
         clicked: response.clicked() && !play,
@@ -1811,13 +2746,37 @@ pub fn shelf(
 ) {
     ui.add_space(8.0);
     theme::section_title(ui, palette, title);
+    shelf_cards(ui, id, add_contents);
+}
+
+/// A shelf whose title opens a page, as Your top songs does; true when the
+/// title was clicked.
+pub fn linked_shelf(
+    ui: &mut Ui,
+    palette: &Palette,
+    id: &str,
+    title: &str,
+    add_contents: impl FnOnce(&mut Ui),
+) -> bool {
+    ui.add_space(8.0);
+    let clicked = theme::link(ui, title, theme::bold(17.0), palette.text).clicked();
+    shelf_cards(ui, id, add_contents);
+    clicked
+}
+
+fn shelf_cards(ui: &mut Ui, id: &str, add_contents: impl FnOnce(&mut Ui)) {
     ui.add_space(4.0);
-    egui::ScrollArea::horizontal().id_salt(id).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = CARD_GAP / 2.0;
-            add_contents(ui);
-        });
-    });
+    crate::autoscroll::show(
+        ui,
+        egui::ScrollArea::horizontal().id_salt(id),
+        egui::Vec2b::new(true, false),
+        |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = CARD_GAP / 2.0;
+                add_contents(ui);
+            });
+        },
+    );
     ui.add_space(12.0);
 }
 
@@ -1829,22 +2788,137 @@ pub fn grid(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
     });
 }
 
-pub fn loading_row(ui: &mut Ui, palette: &Palette) {
+/// The colour of a skeleton's shapes: the surface a loaded row or card
+/// draws on, so the page keeps its look while it loads.
+fn skeleton_fill(palette: &Palette) -> egui::Color32 {
+    palette
+        .surface_hover
+        .gamma_multiply(if palette.dark { 0.9 } else { 1.0 })
+}
+
+/// How wide a skeleton's text bar is, as a share of its room: varied by
+/// row so the placeholder reads as a list rather than a grid.
+fn skeleton_share(index: usize, line: usize) -> f32 {
+    const SHARES: [f32; 5] = [0.62, 0.48, 0.71, 0.55, 0.4];
+    SHARES[(index * 2 + line) % SHARES.len()] * if line == 0 { 1.0 } else { 0.7 }
+}
+
+/// Placeholder rows shaped like the songs a page is loading, in place of a
+/// spinner (#674): a cover and two lines each. They are drawn once and do
+/// not move, so loading asks for no frames. Screen readers hear Loading….
+pub fn skeleton_rows(ui: &mut Ui, palette: &Palette, locale: Locale, count: usize) {
+    let fill = skeleton_fill(palette);
+    let (rect, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), theme::ROW_HEIGHT * count as f32),
+        Sense::hover(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, gettext(locale, "Loading…"))
+    });
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter_at(rect);
+    for index in 0..count {
+        let top = rect.top() + theme::ROW_HEIGHT * index as f32;
+        let cover = Rect::from_min_size(
+            pos2(rect.left() + 12.0, top + (theme::ROW_HEIGHT - 40.0) / 2.0),
+            Vec2::splat(40.0),
+        );
+        painter.rect_filled(cover, CornerRadius::same(4), fill);
+        let room = (rect.right() - cover.right() - 32.0).clamp(0.0, 420.0);
+        for (line, (y, height)) in [(top + 18.0, 10.0), (top + 34.0, 8.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let bar = Rect::from_min_size(
+                pos2(cover.right() + 14.0, y),
+                vec2(room * skeleton_share(index, line), height),
+            );
+            painter.rect_filled(bar, CornerRadius::same(4), fill);
+        }
+    }
+}
+
+/// Placeholder cards for a shelf that is loading, the size of the cards it
+/// will show, round for artists. Like [`skeleton_rows`], they do not move.
+pub fn skeleton_cards(ui: &mut Ui, palette: &Palette, locale: Locale, count: usize, round: bool) {
+    let fill = skeleton_fill(palette);
+    const PAD: f32 = 12.0;
+    let height = PAD + CARD_ART + 10.0 + 14.0 + 6.0 + 10.0 + PAD;
+    for index in 0..count {
+        let (rect, response) = ui.allocate_exact_size(vec2(CARD_WIDTH, height), Sense::hover());
+        if index == 0 {
+            response.widget_info(|| {
+                egui::WidgetInfo::labeled(
+                    egui::WidgetType::Label,
+                    true,
+                    gettext(locale, "Loading…"),
+                )
+            });
+        }
+        if !ui.is_rect_visible(rect) {
+            continue;
+        }
+        let painter = ui.painter();
+        let art = Rect::from_min_size(rect.min + vec2(PAD, PAD), Vec2::splat(CARD_ART));
+        let radius = if round { CARD_ART / 2.0 } else { 6.0 };
+        painter.rect_filled(art, CornerRadius::same(radius as u8), fill);
+        let title = Rect::from_min_size(
+            pos2(art.left(), art.bottom() + 12.0),
+            vec2(CARD_ART * skeleton_share(index, 0), 12.0),
+        );
+        painter.rect_filled(title, CornerRadius::same(4), fill);
+        let subtitle = Rect::from_min_size(
+            pos2(art.left(), title.bottom() + 8.0),
+            vec2(CARD_ART * skeleton_share(index, 1), 9.0),
+        );
+        painter.rect_filled(subtitle, CornerRadius::same(4), fill);
+    }
+}
+
+pub fn loading_row(ui: &mut Ui, palette: &Palette, locale: Locale) {
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         theme::spinner(ui, 18.0, palette.accent);
-        theme::subtle(ui, palette, "Loading…");
+        theme::subtle(ui, palette, &gettext(locale, "Loading…"));
     });
+}
+
+pub fn sanitize_error_message<'a>(message: &'a str, locale: Locale) -> std::borrow::Cow<'a, str> {
+    if message.contains("http://")
+        || message.contains("https://")
+        || message.contains("error sending request for url")
+        || message.contains("dns error")
+        || message.contains("connection closed")
+    {
+        gettext(locale, "Network connection error. Check your connection.")
+    } else {
+        std::borrow::Cow::Borrowed(message)
+    }
 }
 
 pub fn error_row(ui: &mut Ui, app: &mut App, message: &str, retry: Option<Page>) {
     let palette = app.palette;
+    let sanitized = sanitize_error_message(message, app.locale);
     ui.horizontal(|ui| {
         ui.add_space(8.0);
         theme::icon(ui, Icon::CircleAlert, 16.0, palette.danger);
-        theme::text(ui, message, theme::regular(13.0), palette.secondary);
+        theme::text(
+            ui,
+            sanitized.as_ref(),
+            theme::regular(13.0),
+            palette.secondary,
+        );
         if let Some(page) = retry
-            && theme::soft_button(ui, &palette, Some(Icon::Refresh), "Retry", false).clicked()
+            && theme::soft_button(
+                ui,
+                &palette,
+                Some(Icon::Refresh),
+                &gettext(app.locale, "Retry"),
+                false,
+            )
+            .clicked()
         {
             app.actions.push(Action::Reload(page));
         }
@@ -1917,13 +2991,13 @@ pub fn thin_slider(
 ) -> SliderEvent {
     let (_, rect) = ui.allocate_space(vec2(width, 16.0));
     let response = ui.interact(rect, id, Sense::click_and_drag());
-    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
     let dragging_value = ui.data(|data| data.get_temp::<f32>(id));
     let pointer_value = response
         .interact_pointer_pos()
         .map(|pos| ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0));
     let mut event = SliderEvent::None;
-    if (response.drag_started() || response.dragged())
+    // Preview on press, before egui's click-or-drag movement threshold.
+    if (response.is_pointer_button_down_on() || response.drag_started() || response.dragged())
         && let Some(v) = pointer_value
     {
         ui.data_mut(|data| data.insert_temp(id, v));
@@ -1936,9 +3010,12 @@ pub fn thin_slider(
     } else if response.clicked()
         && let Some(v) = pointer_value
     {
+        ui.data_mut(|data| data.remove::<f32>(id));
         event = SliderEvent::Committed(v);
     }
-    if let Some(step) = wheel_step {
+    if let Some(step) = wheel_step
+        && response.enabled()
+    {
         let notches = wheel_notches(ui, &response);
         if notches != 0 {
             event = SliderEvent::Committed((value + step * notches as f32).clamp(0.0, 1.0));
@@ -2044,10 +3121,84 @@ pub fn chips<T: PartialEq + Copy>(
     selected
 }
 
+/// A text input with the native clipboard actions and a selection-aware menu.
+pub fn text_edit(ui: &mut Ui, locale: Locale, edit: egui::TextEdit<'_>) -> egui::Response {
+    let mut output = edit.show(ui);
+    let response = &output.response;
+    let selection_id = response.id.with("edit-menu-selection");
+    // egui moves the caret on any mouse-button press and clears a selection
+    // when a popup takes focus. Keep the field's previous selection while its
+    // edit menu is opening or open.
+    let keep_selection = response.context_menu_opened()
+        || response.secondary_clicked()
+        || (response.contains_pointer()
+            && ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Secondary)));
+    if keep_selection {
+        if let Some(range) = ui.data(|data| data.get_temp::<egui::text::CCursorRange>(selection_id))
+        {
+            output.state.cursor.set_char_range(Some(range));
+            output.state.clone().store(ui.ctx(), response.id);
+        }
+    } else if let Some(range) = output.state.cursor.char_range() {
+        ui.data_mut(|data| data.insert_temp(selection_id, range));
+    }
+    let selected = output
+        .state
+        .cursor
+        .char_range()
+        .is_some_and(|range| !range.is_empty());
+    response.context_menu(|ui| {
+        for (label, enabled, command) in [
+            (
+                gettext(locale, "Cut"),
+                selected,
+                egui::ViewportCommand::RequestCut,
+            ),
+            (
+                gettext(locale, "Copy"),
+                selected,
+                egui::ViewportCommand::RequestCopy,
+            ),
+            (
+                gettext(locale, "Paste"),
+                true,
+                egui::ViewportCommand::RequestPaste,
+            ),
+        ] {
+            if ui
+                .add_enabled(enabled, egui::Button::new(label.as_ref()))
+                .clicked()
+            {
+                // Menu clicks take focus. Restore this field before the native
+                // integration delivers the clipboard event on the next frame.
+                response.request_focus();
+                ui.ctx().send_viewport_cmd(command);
+                ui.close();
+            }
+        }
+        ui.separator();
+        if ui.button(gettext(locale, "Select all").as_ref()).clicked() {
+            let end = output.galley.job.text.chars().count();
+            output
+                .state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(0),
+                    egui::text::CCursor::new(end),
+                )));
+            output.state.clone().store(ui.ctx(), response.id);
+            response.request_focus();
+            ui.close();
+        }
+    });
+    output.response.response
+}
+
 /// A text field with a leading search icon.
 pub fn search_field(
     ui: &mut Ui,
     palette: &Palette,
+    locale: Locale,
     id: egui::Id,
     text: &mut String,
     hint: &str,
@@ -2084,19 +3235,23 @@ pub fn search_field(
             .max_rect(field_rect)
             .layout(Layout::left_to_right(Align::Center)),
     );
-    // A right-to-left query is shown in reading order. The caret keeps
-    // egui's own idea of where it is: at the end of what was typed.
+    // A right-to-left query is shown in reading order. The glyphs stay in
+    // the buffer's order, flagged by direction, so the caret follows them.
     let text_color = palette.text;
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap_width: f32| {
-        let shown = crate::bidi::display_text(buffer.as_str()).into_owned();
-        ui.painter()
+        let mut galley = ui
+            .painter()
             .layout_job(egui::text::LayoutJob::simple_singleline(
-                shown,
+                buffer.as_str().to_owned(),
                 theme::regular(14.0),
                 text_color,
-            ))
+            ));
+        crate::bidi::reorder(&mut galley);
+        galley
     };
-    let response = child.add(
+    let response = text_edit(
+        &mut child,
+        locale,
         egui::TextEdit::singleline(text)
             .id(id)
             .hint_text(egui::RichText::new(hint).color(palette.dim))
@@ -2110,9 +3265,13 @@ pub fn search_field(
     ui.ctx()
         .accesskit_node_builder(response.id, |node| node.set_label(hint));
     if !text.is_empty() {
+        // The box must fit what `theme::icon_button` allocates around the
+        // glyph; a smaller child makes egui clamp its centered layout to
+        // the child's top edge, dropping the glyph below the midline.
+        let clear_size = 15.0;
         let clear_rect = Rect::from_center_size(
             pos2(rect.right() - 17.0, rect.center().y),
-            Vec2::splat(24.0),
+            Vec2::splat(clear_size + theme::ICON_BUTTON_PAD),
         );
         let mut clear = ui.new_child(
             UiBuilder::new()
@@ -2122,10 +3281,10 @@ pub fn search_field(
         if theme::icon_button(
             &mut clear,
             Icon::X,
-            15.0,
+            clear_size,
             palette.secondary,
             palette.text,
-            "Clear",
+            &gettext(locale, "Clear"),
         )
         .clicked()
         {
@@ -2160,8 +3319,40 @@ pub fn switch(ui: &mut Ui, palette: &Palette, label: &str, on: &mut bool) -> egu
         egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), *on, label)
     });
     theme::focus_ring(ui, &response);
-    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    response
 }
+
+/// The author's website, linked from the credit line.
+pub const AUTHOR_URL: &str = "https://paolino.me";
+
+/// "Built with love by Carmine Paolino", with the name linking to
+/// [`AUTHOR_URL`]. Returns whether the name was clicked.
+pub fn credit(ui: &mut Ui, palette: &Palette, locale: Locale) -> bool {
+    // Translators: {name} is replaced by the author's name, shown as a link.
+    let sentence = gettext(locale, "Built with love by {name}");
+    let (before, after) = sentence.split_once("{name}").unwrap_or((&sentence, ""));
+    let mut clicked = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        theme::text(ui, "\u{2665}  ", theme::regular(13.0), palette.danger);
+        theme::text(ui, before, theme::regular(13.0), palette.secondary);
+        clicked = theme::link(ui, "Carmine Paolino", theme::medium(13.0), palette.text)
+            .on_hover_text(AUTHOR_URL)
+            .clicked();
+        if !after.is_empty() {
+            theme::text(ui, after, theme::regular(13.0), palette.secondary);
+        }
+    });
+    clicked
+}
+
+/// The width a settings row keeps for its control: switches, fields and
+/// buttons fit in it.
+const SETTING_CONTROL_WIDTH: f32 = 260.0;
+
+/// The narrowest a settings row's text may get beside its control before
+/// the control moves below it.
+const SETTING_TEXT_MIN_WIDTH: f32 = 140.0;
 
 /// A labelled row in a settings section.
 pub fn setting_row(
@@ -2171,26 +3362,234 @@ pub fn setting_row(
     description: &str,
     control: impl FnOnce(&mut Ui),
 ) {
-    ui.horizontal(|ui| {
+    setting_row_sized(ui, palette, label, description, 0.0, control);
+}
+
+/// A settings row whose control needs `control_width` points, such as a
+/// row of choices. Its text wraps before a control wider than usual, and
+/// in a window too narrow for both, any control goes on its own line below
+/// the text. The width comes from the caller, not from the last frame, so
+/// the layout never has to settle.
+pub fn setting_row_sized(
+    ui: &mut Ui,
+    palette: &Palette,
+    label: &str,
+    description: &str,
+    control_width: f32,
+    control: impl FnOnce(&mut Ui),
+) {
+    let reserved = (control_width + 16.0).max(SETTING_CONTROL_WIDTH);
+    let text = |ui: &mut Ui| {
+        theme::text(ui, label, theme::medium(14.0), palette.text);
+        if !description.is_empty() {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(description)
+                        .font(theme::regular(12.5))
+                        .color(palette.secondary),
+                )
+                .wrap(),
+            );
+        }
+    };
+    if ui.available_width() - reserved < SETTING_TEXT_MIN_WIDTH {
         ui.vertical(|ui| {
-            // A frame can arrive before the window has its size (a fullscreen
-            // request on Wayland answers a frame late), so never go negative.
-            ui.set_width((ui.available_width() - 260.0).max(0.0));
-            theme::text(ui, label, theme::medium(14.0), palette.text);
-            if !description.is_empty() {
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(description)
-                            .font(theme::regular(12.5))
-                            .color(palette.secondary),
+            text(ui);
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), control);
+            });
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                // A frame can arrive before the window has its size (a
+                // fullscreen request on Wayland answers a frame late), so
+                // never go negative.
+                ui.set_width((ui.available_width() - reserved).max(0.0));
+                text(ui);
+            });
+            ui.with_layout(Layout::right_to_left(Align::Center), control);
+        });
+    }
+    ui.add_space(10.0);
+}
+
+/// A labelled text field: the caption sits above the box.
+pub fn labeled_field(
+    ui: &mut Ui,
+    palette: &Palette,
+    locale: Locale,
+    label: &str,
+    value: &mut String,
+    hint: &str,
+    password: bool,
+) -> egui::Response {
+    let response = ui
+        .vertical(|ui| {
+            theme::text(ui, label, theme::medium(13.0), palette.text);
+            ui.add_space(6.0);
+            Frame::new()
+                .fill(palette.surface)
+                .corner_radius(CornerRadius::same(8))
+                .inner_margin(Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    text_edit(
+                        ui,
+                        locale,
+                        egui::TextEdit::singleline(value)
+                            .hint_text(egui::RichText::new(hint).color(palette.dim))
+                            .font(theme::regular(14.0))
+                            .password(password)
+                            .frame(egui::Frame::NONE)
+                            .desired_width(ui.available_width()),
                     )
-                    .wrap(),
-                );
+                })
+                .inner
+        })
+        .inner;
+    ui.ctx()
+        .accesskit_node_builder(response.id, |node| node.set_label(label));
+    response
+}
+
+/// Host, port, username, and password in two columns.
+pub fn proxy_manual_form(
+    ui: &mut Ui,
+    palette: &Palette,
+    locale: Locale,
+    host: &mut String,
+    port: &mut String,
+    username: &mut String,
+    password: &mut String,
+) -> bool {
+    let mut changed = false;
+    let mut address_changed = false;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        let half = ((ui.available_width() - 12.0) / 2.0).max(80.0);
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            if labeled_field(
+                ui,
+                palette,
+                locale,
+                &gettext(locale, "Host"),
+                host,
+                "127.0.0.1",
+                false,
+            )
+            .changed()
+            {
+                changed = true;
+                address_changed = true;
             }
         });
-        ui.with_layout(Layout::right_to_left(Align::Center), control);
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            if labeled_field(
+                ui,
+                palette,
+                locale,
+                &gettext(locale, "Port"),
+                port,
+                "1080",
+                false,
+            )
+            .changed()
+            {
+                changed = true;
+                address_changed = true;
+            }
+        });
     });
     ui.add_space(10.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 12.0;
+        let half = ((ui.available_width() - 12.0) / 2.0).max(80.0);
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            let label = gettext(locale, "Username");
+            if labeled_field(ui, palette, locale, &label, username, &label, false).changed() {
+                changed = true;
+                address_changed = true;
+            }
+        });
+        ui.vertical(|ui| {
+            ui.set_width(half);
+            if address_changed {
+                password.clear();
+            }
+            let label = gettext(locale, "Password");
+            if labeled_field(ui, palette, locale, &label, password, &label, true).changed() {
+                changed = true;
+            }
+        });
+    });
+    changed
+}
+
+pub fn proxy_scope_note(
+    ui: &mut Ui,
+    palette: &Palette,
+    locale: Locale,
+    mode: crate::settings::ProxyMode,
+) {
+    let note = match mode {
+        crate::settings::ProxyMode::Http => gettext(
+            locale,
+            "Proxy login applies to Web requests. Local playback uses this proxy only without a login.",
+        ),
+        crate::settings::ProxyMode::Socks => gettext(
+            locale,
+            "Spotify hostnames are resolved by the proxy. Local playback connects directly.",
+        ),
+        crate::settings::ProxyMode::Off | crate::settings::ProxyMode::System => return,
+    };
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(note)
+                .font(theme::regular(13.0))
+                .color(palette.secondary),
+        )
+        .wrap(),
+    );
+}
+
+#[cfg(test)]
+mod playing_cover_tests {
+    use super::*;
+
+    /// The last song's cover stands in for the next one's only right after
+    /// the change: not for a song without art, not after a gap, and not for
+    /// good when the new cover cannot be had.
+    #[test]
+    fn the_last_songs_cover_stands_in_only_for_a_moment() {
+        let shown = ShownCover {
+            url: std::sync::Arc::from("https://i.scdn.co/image/a"),
+            seen: 10.0,
+        };
+        let next = Some("https://i.scdn.co/image/c");
+        assert_eq!(
+            stand_in(Some(&shown), next, 10.5).as_deref(),
+            Some("https://i.scdn.co/image/a")
+        );
+        assert_eq!(
+            stand_in(Some(&shown), None, 10.5),
+            None,
+            "a song without art"
+        );
+        assert_eq!(
+            stand_in(Some(&shown), Some("https://i.scdn.co/image/a"), 10.5),
+            None
+        );
+        assert_eq!(
+            stand_in(Some(&shown), next, 10.0 + PLAYING_COVER_HOLD),
+            None,
+            "too late"
+        );
+        assert_eq!(stand_in(None, next, 10.5), None);
+    }
 }
 
 #[cfg(test)]
@@ -2201,9 +3600,316 @@ mod tests {
     use crate::paths::AppDirs;
     use crate::settings::Settings;
 
+    #[test]
+    fn editing_a_proxy_endpoint_clears_its_password_but_password_entry_is_preserved() {
+        for label in ["Host", "Port", "Username", "Password"] {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            theme::install(&ctx);
+            let mut fields = [
+                "127.0.0.1".to_string(),
+                "8080".into(),
+                "dummy-user".into(),
+                "dummy-password".into(),
+            ];
+            let mut frame = |events| {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            vec2(600.0, 400.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        let [host, port, username, password] = &mut fields;
+                        proxy_manual_form(
+                            ui,
+                            &Palette::dark(),
+                            Locale::English,
+                            host,
+                            port,
+                            username,
+                            password,
+                        );
+                    },
+                );
+                output.textures_delta.clear();
+                output
+            };
+            let tree = frame(vec![]).platform_output.accesskit_update.unwrap();
+            let target = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| {
+                    node.label() == Some(label)
+                        && matches!(
+                            node.role(),
+                            egui::accesskit::Role::TextInput | egui::accesskit::Role::PasswordInput
+                        )
+                })
+                .expect("labeled proxy field")
+                .0;
+            frame(vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    target_node: target,
+                    action: egui::accesskit::Action::Focus,
+                    data: None,
+                },
+            )]);
+            frame(vec![egui::Event::Text("x".into())]);
+            if label == "Password" {
+                assert!(fields[3].contains("dummy-password"));
+                assert!(fields[3].contains('x'));
+            } else {
+                assert!(
+                    fields[3].is_empty(),
+                    "{label} must clear the previous endpoint's password"
+                );
+            }
+        }
+    }
+
+    struct TextMenu {
+        ctx: egui::Context,
+        text: String,
+        multiline: bool,
+        response: Option<egui::Response>,
+    }
+
+    impl TextMenu {
+        fn new(multiline: bool) -> Self {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            theme::install(&ctx);
+            let mut menu = Self {
+                ctx,
+                text: "Björk 音楽".into(),
+                multiline,
+                response: None,
+            };
+            menu.frame(vec![]);
+            menu
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> egui::FullOutput {
+            let mut output = self.ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(600.0, 400.0))),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    self.response = Some(if self.multiline {
+                        text_edit(
+                            ui,
+                            Locale::English,
+                            egui::TextEdit::multiline(&mut self.text).id_source("edit"),
+                        )
+                    } else {
+                        search_field(
+                            ui,
+                            &Palette::dark(),
+                            Locale::English,
+                            egui::Id::new("edit"),
+                            &mut self.text,
+                            "Search",
+                            300.0,
+                        )
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            output
+        }
+
+        fn select(&mut self, start: usize, end: usize) {
+            self.response.as_ref().unwrap().request_focus();
+            self.frame(vec![]);
+            let response = self.response.as_ref().unwrap();
+            let mut state = egui::TextEdit::load_state(&self.ctx, response.id).unwrap();
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::two(
+                    egui::text::CCursor::new(start),
+                    egui::text::CCursor::new(end),
+                )));
+            state.store(&self.ctx, response.id);
+            response.request_focus();
+            self.frame(vec![]);
+        }
+
+        fn open(&mut self) -> egui::accesskit::TreeUpdate {
+            let pos = self.response.as_ref().unwrap().rect.center();
+            self.frame(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            self.frame(vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            self.frame(vec![]).platform_output.accesskit_update.unwrap()
+        }
+
+        fn choose(&mut self, label: &str) -> egui::FullOutput {
+            let tree = self.open();
+            let (target, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .expect(label);
+            assert!(!node.is_disabled(), "{label} is disabled");
+            self.frame(vec![egui::Event::AccessKitActionRequest(
+                egui::accesskit::ActionRequest {
+                    target_tree: egui::accesskit::TreeId::ROOT,
+                    target_node: *target,
+                    action: egui::accesskit::Action::Click,
+                    data: None,
+                },
+            )])
+        }
+    }
+
+    #[test]
+    fn text_menu_preserves_selection_and_uses_native_clipboard_events() {
+        for multiline in [false, true] {
+            let mut menu = TextMenu::new(multiline);
+            menu.select(6, 8);
+            let output = menu.choose("Copy");
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::RequestCopy)
+            );
+            // The native integration delivers these events after reading the
+            // clipboard. Keep tests independent of the user's real clipboard.
+            let output = menu.frame(vec![egui::Event::Copy]);
+            assert!(
+                output
+                    .platform_output
+                    .commands
+                    .contains(&egui::OutputCommand::CopyText("音楽".into()))
+            );
+            assert_eq!(menu.text, "Björk 音楽");
+
+            let output = menu.choose("Cut");
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::RequestCut)
+            );
+            menu.frame(vec![egui::Event::Cut]);
+            assert_eq!(menu.text, "Björk ");
+            assert!(menu.response.as_ref().unwrap().changed());
+
+            menu.frame(vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }]);
+            assert_eq!(menu.text, "Björk 音楽", "menu edits keep keyboard undo");
+
+            menu.select(0, 5);
+            let output = menu.choose("Paste");
+            assert!(
+                output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::RequestPaste)
+            );
+            menu.frame(vec![egui::Event::Paste("新しい".into())]);
+            assert_eq!(menu.text, "新しい 音楽");
+            assert!(menu.response.as_ref().unwrap().changed());
+
+            menu.choose("Select all");
+            menu.frame(vec![egui::Event::Text("replacement".into())]);
+            assert_eq!(menu.text, "replacement");
+            assert!(menu.response.as_ref().unwrap().has_focus());
+        }
+    }
+
+    #[test]
+    fn text_menu_disables_cut_and_copy_without_a_selection() {
+        let mut menu = TextMenu::new(false);
+        menu.select(2, 2);
+        let tree = menu.open();
+        for label in ["Cut", "Copy"] {
+            let (_, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label))
+                .unwrap();
+            assert!(node.is_disabled(), "{label} needs a selection");
+        }
+    }
+
+    /// The clear button sits on the search pill's midline. The button
+    /// allocates its glyph plus [`theme::ICON_BUTTON_PAD`] on every side,
+    /// so the box handed to it must be that wide: in a tighter one egui
+    /// clamps the centered layout to the box's top edge and the glyph
+    /// lands below the midline.
+    #[test]
+    fn the_clear_button_sits_on_the_search_pill_midline() {
+        use egui::accesskit::Role;
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        theme::install(&ctx);
+        let mut text = "michael".to_string();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(600.0, 400.0))),
+                ..Default::default()
+            },
+            |ui| {
+                search_field(
+                    ui,
+                    &Palette::dark(),
+                    Locale::English,
+                    egui::Id::new("clear-midline"),
+                    &mut text,
+                    "Search",
+                    300.0,
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("screen-reader tree");
+        let midline = |label: &str, role: Role| {
+            let bounds = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some(label) && node.role() == role)
+                .unwrap_or_else(|| panic!("missing {label:?} {role:?}"))
+                .1
+                .bounds()
+                .expect("bounds");
+            (bounds.y0 + bounds.y1) / 2.0
+        };
+        let field = midline("Search", Role::TextInput);
+        let clear = midline("Clear", Role::Button);
+        assert!(
+            (field - clear).abs() < 0.6,
+            "the clear button must sit on the search pill's midline: got {clear}, expected {field}"
+        );
+    }
+
     fn test_app() -> App {
         let root = std::env::temp_dir().join(format!(
-            "fastpotify-virtual-{}-{}",
+            "spotifast-virtual-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2222,6 +3928,7 @@ mod tests {
                 media_controls: false,
                 restore_sign_in: false,
                 tray: false,
+                autostart: false,
             },
         )
     }
@@ -2245,6 +3952,53 @@ mod tests {
         output.textures_delta.clear();
     }
 
+    #[test]
+    fn thin_slider_responds_on_press_and_commits_without_movement() {
+        for enabled in [true, false] {
+            let ctx = egui::Context::default();
+            let id = egui::Id::new("press-slider");
+            let size = vec2(300.0, 100.0);
+            let clip = Rect::from_min_size(pos2(0.0, 0.0), size);
+            let frame = |events| {
+                let mut event = SliderEvent::None;
+                run_on(&ctx, size, clip, events, |ui| {
+                    ui.add_enabled_ui(enabled, |ui| {
+                        event =
+                            thin_slider(ui, &Palette::dark(), id, "Volume", 0.2, 100.0, Some(0.05));
+                    });
+                });
+                event
+            };
+            frame(Vec::new());
+            let rect = ctx.read_response(id).unwrap().rect;
+            let pos = pos2(rect.left() + rect.width() * 0.75, rect.center().y);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let pressed = frame(vec![egui::Event::PointerMoved(pos), button(true)]);
+            if enabled {
+                assert!(
+                    matches!(pressed, SliderEvent::Dragging(v) if (v - 0.75).abs() < 0.001),
+                    "the initial press must preview volume without any mouse movement"
+                );
+            } else {
+                assert!(matches!(pressed, SliderEvent::None));
+            }
+            let released = frame(vec![button(false)]);
+            if enabled {
+                assert!(matches!(released, SliderEvent::Committed(v) if (v - 0.75).abs() < 0.001));
+                assert!(ctx.data(|data| data.get_temp::<f32>(id)).is_none());
+                // A quick click can arrive entirely within one frame.
+                let clicked = frame(vec![button(true), button(false)]);
+                assert!(matches!(clicked, SliderEvent::Committed(v) if (v - 0.75).abs() < 0.001));
+            } else {
+                assert!(matches!(released, SliderEvent::None));
+            }
+        }
+    }
     fn run(size: Vec2, clip: Rect, events: Vec<egui::Event>, f: impl FnMut(&mut Ui)) {
         run_on(&egui::Context::default(), size, clip, events, f);
     }
@@ -2486,5 +4240,420 @@ mod tests {
         );
         assert!(!painted.is_empty());
         assert_eq!(painted[0], 0);
+    }
+
+    fn song(uri: &str) -> PlayableItem {
+        PlayableItem::Track(Track {
+            uri: uri.to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn track_row_selection_preserves_transparency_and_focus_without_an_outline() {
+        for mut palette in [Palette::dark(), Palette::light()] {
+            // A vivid custom accent must not tint a selected row either.
+            palette.accent = Color32::from_rgb(255, 0, 90);
+            for (picked, focused) in [(true, false), (true, true), (false, true)] {
+                let mut app = test_app();
+                app.backend.shutdown();
+                app.palette = palette;
+                let ctx = egui::Context::default();
+                theme::install(&ctx);
+                theme::apply(&ctx, &palette);
+                let item = song("spotify:track:selected");
+                let context = RowContext::Queue;
+                let mut rect = Rect::NOTHING;
+                let mut id = egui::Id::NULL;
+                let mut draw = || {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                vec2(760.0, 520.0),
+                            )),
+                            events: vec![egui::Event::PointerGone],
+                            ..Default::default()
+                        },
+                        |ui| {
+                            let (response, _) = track_row_response(
+                                ui,
+                                &mut app,
+                                TrackRow {
+                                    index: 0,
+                                    number: Some(1),
+                                    item: &item,
+                                    context: &context,
+                                    show_cover: false,
+                                    show_album: false,
+                                    added_at: None,
+                                    added_by: None,
+                                    show_added_by: false,
+                                    show_plays: false,
+                                    compact: false,
+                                    thin: false,
+                                    shift: 0.0,
+                                    picked,
+                                    picked_songs: &[],
+                                    picked_positions: &[],
+                                    position: None,
+                                },
+                            );
+                            rect = response.rect;
+                            id = response.id;
+                            if focused {
+                                response.request_focus();
+                            }
+                        },
+                    );
+                    output.textures_delta.clear();
+                    output
+                };
+                draw();
+                let output = draw();
+                let fills: Vec<_> = output
+                    .shapes
+                    .iter()
+                    .filter_map(|shape| match &shape.shape {
+                        egui::epaint::Shape::Rect(shape) if shape.rect == rect => Some(shape.fill),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    fills,
+                    [if picked {
+                        palette
+                            .secondary
+                            .gamma_multiply(if focused { 0.30 } else { 0.20 })
+                    } else {
+                        palette
+                            .surface_hover
+                            .gamma_multiply(if palette.dark { 0.7 } else { 1.0 })
+                    }]
+                );
+                if focused {
+                    assert!(ctx.memory(|memory| memory.has_focus(id)));
+                }
+                assert!(
+                    output.shapes.iter().all(|shape| match &shape.shape {
+                        egui::epaint::Shape::Rect(shape)
+                            if shape.rect == rect || shape.rect == rect.expand(2.0) =>
+                        {
+                            shape.stroke == Stroke::NONE
+                                && (shape.rect != rect
+                                    || shape.corner_radius == CornerRadius::same(6))
+                        }
+                        _ => true,
+                    }),
+                    "row selection and focus must not add a border or change the row shape"
+                );
+                assert_eq!(rect.height(), theme::ROW_HEIGHT);
+                assert!(app.actions.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn dragging_a_picked_row_carries_the_whole_selection() {
+        let first = song("spotify:track:first");
+        let second = song("spotify:track:second");
+        let dragged = dragged_items(&second, true, &[first.clone(), second.clone()]);
+        assert_eq!(
+            dragged.iter().map(PlayableItem::uri).collect::<Vec<_>>(),
+            [first.uri(), second.uri()],
+            "the sidebar receives every selected row in table order"
+        );
+    }
+
+    #[test]
+    fn dragging_multiple_songs_labels_the_first_and_the_rest() {
+        let track = DragTrack {
+            title: "Fitraten (VDJ Fly LoFi)".into(),
+            image: None,
+            items: vec![
+                PlayableItem::Track(Track {
+                    name: "Kora Panna".into(),
+                    ..Default::default()
+                }),
+                PlayableItem::Track(Track {
+                    name: "Fitraten (VDJ Fly LoFi)".into(),
+                    ..Default::default()
+                }),
+            ],
+            from: None,
+            source_playlist: None,
+        };
+        assert_eq!(drag_label(Locale::English, &track), "Kora Panna + 1 more");
+    }
+
+    #[test]
+    fn menu_submenu_registers_focus_and_opens_from_keyboard() {
+        let ctx = egui::Context::default();
+        crate::theme::install(&ctx);
+        let palette = Palette::dark();
+        let mut child_rendered = false;
+        let mut target_id = None;
+
+        // Frame 1: secondary click to open context menu
+        let input1 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 400.0))),
+            events: vec![egui::Event::PointerButton {
+                pos: pos2(50.0, 50.0),
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut output1 = ctx.run_ui(input1, |ui| {
+            let res = ui.allocate_response(vec2(100.0, 100.0), Sense::click());
+            egui::Popup::menu(&res).open(true).show(|ui| {
+                let prev_id = ui.next_auto_id();
+                target_id = Some(prev_id);
+                menu_submenu(ui, &palette, None, "Submenu", |ui| {
+                    child_rendered = true;
+                    ui.label("Child content");
+                });
+            });
+        });
+        output1.textures_delta.clear();
+
+        let target_id = target_id.expect("context menu must be opened and render submenu button");
+        assert!(!child_rendered, "submenu child must be closed initially");
+
+        // Request keyboard focus onto the submenu button
+        ctx.memory_mut(|mem| mem.request_focus(target_id));
+
+        // Frame 2: trigger activation via Space key
+        let input2 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 400.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let mut output2 = ctx.run_ui(input2, |ui| {
+            let res = ui.allocate_response(vec2(100.0, 100.0), Sense::click());
+            egui::Popup::menu(&res).open(true).show(|ui| {
+                menu_submenu(ui, &palette, None, "Submenu", |ui| {
+                    child_rendered = true;
+                    ui.label("Child content");
+                });
+            });
+        });
+        output2.textures_delta.clear();
+
+        assert!(
+            child_rendered,
+            "menu_submenu must open child contents when Space is pressed while focused"
+        );
+
+        // Frame 3: toggle closed with Space, then reopen with Enter
+        let input3 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 400.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Space,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        child_rendered = false;
+        let mut output3 = ctx.run_ui(input3, |ui| {
+            let res = ui.allocate_response(vec2(100.0, 100.0), Sense::click());
+            egui::Popup::menu(&res).open(true).show(|ui| {
+                menu_submenu(ui, &palette, None, "Submenu", |ui| {
+                    child_rendered = true;
+                    ui.label("Child content");
+                });
+            });
+        });
+        output3.textures_delta.clear();
+        assert!(
+            !child_rendered,
+            "menu_submenu must close child contents when Space is pressed again"
+        );
+
+        // Frame 4: reopen with Enter
+        let input4 = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 400.0))),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        child_rendered = false;
+        let mut output4 = ctx.run_ui(input4, |ui| {
+            let res = ui.allocate_response(vec2(100.0, 100.0), Sense::click());
+            egui::Popup::menu(&res).open(true).show(|ui| {
+                menu_submenu(ui, &palette, None, "Submenu", |ui| {
+                    child_rendered = true;
+                    ui.label("Child content");
+                });
+            });
+        });
+        output4.textures_delta.clear();
+        assert!(
+            child_rendered,
+            "menu_submenu must open child contents when Enter is pressed while focused"
+        );
+    }
+
+    /// Draws a settings row in a window `width` points wide with a control
+    /// `control_width` points wide; returns the description's and the
+    /// control's bounds.
+    fn setting_row_bounds(
+        width: f32,
+        control_width: f32,
+    ) -> (egui::accesskit::Rect, egui::accesskit::Rect) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::theme::install(&ctx);
+        let palette = crate::theme::Palette::dark();
+        // Long enough to wrap, as a translation of a short English line can be.
+        let description = "Höhere Bitraten verbrauchen mehr Daten und Cache-Speicher, \
+            besonders unterwegs, und brauchen länger, bis die Wiedergabe beginnt, wenn die \
+            Verbindung langsam ist.";
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                super::setting_row_sized(
+                    ui,
+                    &palette,
+                    "Audioqualität",
+                    description,
+                    control_width,
+                    |ui| {
+                        let _ = ui.add_sized(
+                            [control_width.max(40.0), 28.0],
+                            egui::Button::new("The control"),
+                        );
+                    },
+                );
+            },
+        );
+        output.textures_delta.clear();
+        let tree = output.platform_output.accesskit_update.unwrap();
+        let bounds = |label: &str| {
+            tree.nodes
+                .iter()
+                .find(|(_, node)| {
+                    [node.label(), node.value()]
+                        .into_iter()
+                        .flatten()
+                        .any(|text| text.starts_with(label))
+                })
+                .and_then(|(_, node)| node.bounds())
+                .unwrap_or_else(|| panic!("{label} is drawn"))
+        };
+        (bounds("Höhere Bitraten"), bounds("The control"))
+    }
+
+    /// A settings row whose control is wider than the usual 260 points,
+    /// like the audio quality choices, wraps its description before the
+    /// control instead of running underneath it.
+    #[test]
+    fn a_setting_row_wraps_its_description_before_a_wide_control() {
+        let (text, control) = setting_row_bounds(1000.0, 600.0);
+        assert!(
+            text.x1 <= control.x0,
+            "the description ends at {} but the control starts at {}",
+            text.x1,
+            control.x0
+        );
+    }
+
+    /// #574: in a narrow window a wide control leaves no room beside it,
+    /// so it goes below the text rather than squeezing the text into a
+    /// column one letter wide.
+    #[test]
+    fn a_setting_row_puts_a_control_that_leaves_no_room_below_its_text() {
+        let (text, control) = setting_row_bounds(560.0, 600.0);
+        assert!(
+            text.width() >= super::SETTING_TEXT_MIN_WIDTH as f64,
+            "the description is only {} points wide",
+            text.width()
+        );
+        assert!(
+            control.y0 >= text.y1,
+            "the control starts at {} but the description ends at {}",
+            control.y0,
+            text.y1
+        );
+    }
+
+    /// Ordinary controls stay beside the text while it has room, as they
+    /// always did; only a window too narrow for both moves them below.
+    #[test]
+    fn an_ordinary_setting_row_keeps_its_control_beside_the_text() {
+        let (below, beside) = setting_row_bounds(380.0, 0.0);
+        assert!(
+            beside.y0 >= below.y1,
+            "a window too narrow for both puts the control below: {below:?} {beside:?}"
+        );
+        let (text, control) = setting_row_bounds(460.0, 0.0);
+        // Stacked, the description would run under the control's column.
+        assert!(
+            text.x1 <= control.x0,
+            "the control moved: description {text:?}, control {control:?}"
+        );
+    }
+
+    /// Covers are painted well below their pixel size, so they are sampled
+    /// through mipmaps: without them a 640 pixel cover on a 148 point card
+    /// shows stair-stepped edges and grain.
+    #[test]
+    fn covers_are_uploaded_with_mipmaps() {
+        let ctx = egui::Context::default();
+        egui_extras::install_image_loaders(&ctx);
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(64, 64, image::Rgb([20, 30, 40]))
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let uri = "bytes://mipmapped-cover.png";
+        ctx.include_bytes(uri, encoded.into_inner());
+        let palette = theme::Palette::dark();
+        let started = std::time::Instant::now();
+        while !ctx
+            .tex_manager()
+            .read()
+            .allocated()
+            .any(|(_, meta)| meta.name == uri)
+        {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(10),
+                "the cover never loaded"
+            );
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(148.0, 148.0));
+                paint_cover(ui, &palette, Some(uri), rect, 6.0, Icon::Disc, None);
+            });
+            output.textures_delta.clear();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let manager = ctx.tex_manager();
+        let manager = manager.read();
+        let (_, meta) = manager
+            .allocated()
+            .find(|(_, meta)| meta.name == uri)
+            .unwrap();
+        assert_eq!(meta.options, crate::images::COVER_TEXTURE);
+        assert_eq!(meta.options.mipmap_mode, Some(egui::TextureFilter::Linear));
     }
 }

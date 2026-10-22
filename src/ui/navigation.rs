@@ -322,6 +322,19 @@ pub fn view(
     }
 }
 
+/// A clicked song row is focusable upstream. Once Vim owns its selection,
+/// release that native row focus so the next letter still reaches Vim.
+/// Text editing and popup controls retain their own focus.
+pub fn release_row_focus(ctx: &egui::Context) {
+    if !ctx.text_edit_focused() && !egui::Popup::is_any_open(ctx) {
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+    }
+}
+
 pub fn pick(app: &mut App, pane: Pane, owner: egui::Id, row: usize, key: egui::Id) {
     if app.settings.vim_keys {
         app.actions.push(Action::NavigationFocus(pane));
@@ -401,7 +414,7 @@ mod tests {
         use crate::{app::AppOptions, paths::AppDirs, settings::Settings};
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let root = std::env::temp_dir().join(format!(
-            "fastpotify-vim-test-{}-{}",
+            "spotifast-vim-test-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
@@ -421,6 +434,7 @@ mod tests {
                 media_controls: false,
                 restore_sign_in: false,
                 tray: false,
+                autostart: false,
             },
         );
         app.attach(&ctx);
@@ -710,7 +724,7 @@ mod tests {
                     .expect("top result must connect to Songs")
                     .clone();
                 assert!(
-                    matches!(app.grid_navigation.navigate(Command::Play), Some(Action::PlayFromRow { uri, index, .. }) if uri == row.item.uri() && index == row.index as u32)
+                    matches!(app.grid_navigation.navigate(Command::Play), Some(Action::PlayFromRow { uri, index: 0, context: crate::model::RowContext::Uris(uris) }) if uri == row.item.uri() && uris.len() == 1 && uris[0] == uri)
                 );
                 assert!(matches!(
                     app.grid_navigation.navigate(Command::Open),
@@ -794,6 +808,28 @@ mod tests {
                 assert_eq!(app.page(), &destination);
             });
         }
+    }
+
+    #[test]
+    fn search_spatial_activation_keeps_display_position_but_plays_one_song() {
+        with_app(|app, ctx| {
+            app.open(Page::Search);
+            frame(app, ctx, vec![]);
+            let card = app
+                .grid_navigation
+                .cards
+                .iter()
+                .find(|card| card.row.as_ref().is_some_and(|row| row.index == 1))
+                .unwrap()
+                .clone();
+            app.grid_navigation.selected = Some(card.id);
+            let uri = card.row.as_ref().unwrap().item.uri();
+            assert!(matches!(
+                app.grid_navigation.navigate(Command::Play),
+                Some(Action::PlayFromRow { context: crate::model::RowContext::Uris(uris), index: 0, uri: playing })
+                    if uris.len() == 1 && uris[0] == uri && playing == uri
+            ));
+        });
     }
 
     #[test]
@@ -1100,28 +1136,20 @@ mod tests {
     }
 
     #[test]
-    fn vim_first_returns_from_a_playlist_position_window() {
+    fn vim_first_returns_to_the_first_loaded_playlist_row() {
         with_app(|app, ctx| {
             app.open(Page::Playlist("pl1".into()));
-            let page = app.playlist_pages.get_mut("pl1").unwrap();
-            let items = page.items.items.clone();
-            page.items.base_offset = 100;
-            page.items.total = Some(140);
-            page.items.revision += 1;
             frame(app, ctx, vec![]);
+            app.actions.push(Action::Navigate(Command::Last));
+            frame(app, ctx, vec![]);
+            assert!(
+                app.navigation
+                    .cursor(Pane::Main)
+                    .row
+                    .is_some_and(|row| row > 0)
+            );
             app.actions.push(Action::Navigate(Command::First));
-            let actions = frame(app, ctx, vec![]);
-            assert!(actions.iter().any(|action| matches!(
-                action,
-                Action::JumpToPlaylistPosition { position: 1, .. }
-            )));
-            assert_eq!(app.playlist_pages["pl1"].items.base_offset, 0);
             frame(app, ctx, vec![]);
-            assert!(app.navigation.cursor(Pane::Main).start);
-            let page = app.playlist_pages.get_mut("pl1").unwrap();
-            page.items.items = items;
-            page.items.loading = false;
-            page.items.revision += 1;
             frame(app, ctx, vec![]);
             assert_eq!(app.navigation.cursor(Pane::Main).row, Some(0));
             assert!(!app.navigation.cursor(Pane::Main).start);

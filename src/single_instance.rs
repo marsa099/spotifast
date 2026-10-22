@@ -1,53 +1,45 @@
 //! Single-instance guard and remote-control channel.
 //!
 //! A second instance would duplicate the Spotify Connect device, MPRIS player,
-//! and tray icon. A second launch raises the running instance and exits.
+//! and tray icon. A second launch hands its request to the running instance
+//! and exits.
 //!
-//! Linux uses a non-queued D-Bus well-known name as the guard and MPRIS
-//! `Raise` to show the running instance. D-Bus releases the name when the
-//! process ends, including after a crash.
+//! The guard is fastframe-instance's slot: an exclusive lock on a file in a
+//! private per-user directory, which the system releases when the process
+//! ends, even after a crash. Requests travel over a socket in that directory
+//! that only the user can open (on Linux and macOS), or on Windows a loopback
+//! port that answers only requests carrying the random token the running
+//! instance writes beside the lock.
 //!
-//! This uses zbus's blocking API because the build includes both async-io and
-//! tokio executors. The blocking connection avoids depending on either runtime
-//! during the startup check.
+//! Clients send one `spotifast:<verb>` line and receive one reply. Commands
+//! enter the same action queue as tray and media-key events. Read commands use
+//! snapshots, so the listener thread never accesses app state. The
+//! `spotifast` command-line subcommands are clients of this channel; MPRIS
+//! remains for media keys and desktop players on Linux.
 //!
-//! macOS and Windows use an exclusive loopback socket for the guard and
-//! control channel. The operating system releases the port when the process
-//! ends.
-//!
-//! On macOS and Windows, clients send one `fastpotify:<verb>` line and receive
-//! one reply. Commands enter the same action queue as tray and media-key
-//! events. Read commands use snapshots, so the listener thread never accesses
-//! app state. Linux uses MPRIS for these controls.
-//!
-//! The Stream Deck plugin uses the same channel. It can set shuffle and repeat,
-//! save the current track, play a URI, list devices, and transfer playback.
 //! Clients poll the current snapshot; the app does not push updates.
-//!
-//! Any local process can reach the port, so `play-uri`, `open-link`, and
-//! `transfer` validate their free-text arguments here.
+//! `play-uri`, `open-link`, and `transfer` validate their free-text arguments
+//! here before anything reaches the app.
 //!
 //! A Spotify link the desktop hands to a second launch reaches the running
-//! instance the same way: `open-link` over the socket, or on Linux the
-//! `Open` method of the `rocks.fastpotify.Instance` interface the guard
-//! serves on its own name.
+//! instance the same way, as `open-link`.
 
-/// The name held for the lifetime of the running instance.
-#[cfg(target_os = "linux")]
-const INSTANCE_NAME: &str = "rocks.fastpotify.Instance";
+/// The name every request and reply starts with, so a copy of another app
+/// never obeys Spotifast's requests.
+const NAME: &str = "spotifast";
 
-/// The MPRIS player to ask when another instance already holds the name.
-#[cfg(target_os = "linux")]
-const MPRIS_NAME: &str = "org.mpris.MediaPlayer2.fastpotify";
-
-/// Where the running instance answers `Open` for links, on [`INSTANCE_NAME`].
-#[cfg(target_os = "linux")]
-const INSTANCE_PATH: &str = "/rocks/fastpotify/Instance";
+/// The reply to an accepted command.
+const OK_REPLY: &str = "ok";
+/// The reply to `nowplaying`, before the snapshot.
+const NOW_REPLY: &str = "now ";
+/// The reply to `devices`, before the snapshot.
+const DEVICES_REPLY: &str = "devices ";
 
 pub enum Outcome {
     /// This process is the only instance. Hold the guard until it exits.
     Only(Guard),
-    /// Another instance is running and has been asked to show its window.
+    /// Another instance is running and took the request to show its window
+    /// or open a link.
     Surfaced,
 }
 
@@ -56,6 +48,8 @@ pub enum Outcome {
 pub enum ControlCommand {
     /// Bring the window forward, creating it if needed.
     Show,
+    /// Re-read local palette files without showing the window or restarting audio.
+    ReloadThemes,
     PlayPause,
     Play,
     Pause,
@@ -80,6 +74,12 @@ pub enum ControlCommand {
     ToggleSaved,
     /// Play a `spotify:` URI: a track, album, playlist, artist, or show.
     PlayUri(String),
+    /// Search Spotify for a track, album, artist, or playlist, and play the
+    /// best match.
+    PlaySearch {
+        kind: String,
+        query: String,
+    },
     /// Open the page for a Spotify link the desktop or another launch
     /// handed over, and bring the window forward.
     OpenLink(String),
@@ -92,10 +92,9 @@ pub enum ControlCommand {
 
 /// Marks this process as the running instance until dropped.
 pub struct Guard {
-    #[cfg(target_os = "linux")]
-    _connection: Option<mpris_server::zbus::blocking::Connection>,
-    /// Filled by control clients, drained by the app every frame. On Linux
-    /// the same requests arrive through MPRIS instead and this stays empty.
+    /// The slot's lock; `None` when running unguarded.
+    _slot: Option<fastframe_instance::Guard>,
+    /// Filled by control clients, drained by the app every frame.
     commands: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>,
     /// Current-track snapshot for `nowplaying` requests.
     now_playing: std::sync::Arc<std::sync::Mutex<String>>,
@@ -104,6 +103,15 @@ pub struct Guard {
 }
 
 impl Guard {
+    fn unguarded() -> Self {
+        Self {
+            _slot: None,
+            commands: Default::default(),
+            now_playing: std::sync::Arc::new(std::sync::Mutex::new(NOTHING_PLAYING.to_owned())),
+            devices: std::sync::Arc::new(std::sync::Mutex::new(NO_DEVICES.to_owned())),
+        }
+    }
+
     /// The queue a control client's commands land in. The app drains it.
     pub fn commands(&self) -> std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> {
         std::sync::Arc::clone(&self.commands)
@@ -126,24 +134,32 @@ pub const NOTHING_PLAYING: &str = "stopped";
 /// Device snapshot used before loading and when Spotify reports no devices.
 pub const NO_DEVICES: &str = "[]";
 
-/// Loopback port that marks a running instance on platforms without a bus.
-/// Registered to nothing; chosen high and out of the ephemeral range.
-#[cfg(not(target_os = "linux"))]
-const INSTANCE_PORT: u16 = 47_113;
-
-/// Every request and reply starts with this, so a foreign program that
-/// happens to hold the port is never mistaken for Fastpotify.
-#[cfg(not(target_os = "linux"))]
-const PREFIX: &str = "fastpotify:";
-#[cfg(not(target_os = "linux"))]
-const OK_REPLY: &str = "fastpotify:ok";
-#[cfg(not(target_os = "linux"))]
-const NOW_REPLY: &str = "fastpotify:now ";
-#[cfg(not(target_os = "linux"))]
-const DEVICES_REPLY: &str = "fastpotify:devices ";
+/// Where the running instance's lock and channel live: the per-user
+/// runtime directory on Linux (the app's own inside Flatpak), the user's
+/// private temporary directory on macOS, where a socket path under
+/// Application Support can outgrow the 104 bytes macOS allows with a long
+/// user name, and beside Spotifast's per-user state on Windows.
+///
+/// A portable Windows copy keeps its settings in its own folder (#703), so
+/// it gets a slot of its own for that folder, kept in the user's profile
+/// rather than the portable folder, which may sit on a drive any user can
+/// read: it never hands a launch to the installed copy or to a portable
+/// copy elsewhere, and the `spotifast` command it runs reaches it.
+fn slot() -> fastframe_instance::Slot {
+    #[cfg(not(windows))]
+    let slot = fastframe_instance::Slot::new(NAME);
+    #[cfg(windows)]
+    let slot = fastframe_instance::Slot::at(
+        crate::paths::AppDirs::installed().state.join("instance"),
+        NAME,
+    );
+    match crate::paths::AppDirs::instance_scope() {
+        Some(scope) => slot.scoped(&scope),
+        None => slot,
+    }
+}
 
 /// What the running instance said back.
-#[cfg(not(target_os = "linux"))]
 pub enum Reply {
     /// The command was accepted.
     Ok,
@@ -158,25 +174,13 @@ pub enum Reply {
 }
 
 /// Sends one verb to the running instance and reads its reply.
-#[cfg(not(target_os = "linux"))]
 pub fn send(verb: &str) -> std::io::Result<Reply> {
-    send_to(INSTANCE_PORT, verb)
+    reply(&slot().send(verb)?)
 }
 
-#[cfg(not(target_os = "linux"))]
-fn send_to(port: u16, verb: &str) -> std::io::Result<Reply> {
-    use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, TcpStream};
-    use std::time::Duration;
-
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.write_all(format!("{PREFIX}{verb}\n").as_bytes())?;
-    // The listener writes one line and closes. Older instances do not reply to
-    // unknown verbs, so the read times out.
-    let mut reply = String::new();
-    stream.read_to_string(&mut reply)?;
-    let line = reply.lines().next().unwrap_or("");
+/// Reads the running instance's reply, without the `spotifast:` prefix the
+/// channel already checked.
+fn reply(line: &str) -> std::io::Result<Reply> {
     if line == OK_REPLY {
         Ok(Reply::Ok)
     } else if let Some(snapshot) = line.strip_prefix(NOW_REPLY) {
@@ -186,131 +190,123 @@ fn send_to(port: u16, verb: &str) -> std::io::Result<Reply> {
     } else {
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "the port is held by something other than Fastpotify",
+            "the running Spotifast answered something unexpected",
         ))
     }
 }
 
 /// Claims the running-instance role, or hands `link` (a canonical
 /// `spotify:` URI, see [`crate::link::parse`]) to the instance that has it
-/// and asks that one to come forward.
-#[cfg(not(target_os = "linux"))]
-pub fn acquire(waker: &crate::backend::Waker, link: Option<&str>) -> Outcome {
-    use std::net::{Ipv4Addr, TcpListener};
-    use std::sync::{Arc, Mutex};
-
-    let unguarded = || Guard {
-        commands: Default::default(),
-        now_playing: Arc::new(Mutex::new(NOTHING_PLAYING.to_owned())),
-        devices: Arc::new(Mutex::new(NO_DEVICES.to_owned())),
-    };
-
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, INSTANCE_PORT)) {
-        Ok(listener) => listener,
-        Err(_) => {
-            // Raise the existing instance only if the port answers as
-            // Fastpotify. A link goes with the request; an instance from
-            // before links does not answer that verb, so a plain show
-            // follows and the link is dropped rather than the launch.
-            let accepted = |reply: Reply| matches!(reply, Reply::Ok);
-            let opened =
-                link.is_some_and(|uri| send(&format!("open-link {uri}")).is_ok_and(accepted));
-            if link.is_some() && !opened {
-                log::warn!("the running Fastpotify does not take links; asking it to show");
-            }
-            let answered = opened || send("show").is_ok_and(accepted);
-            if answered {
-                return Outcome::Surfaced;
-            }
-            log::warn!("port {INSTANCE_PORT} is busy but not with Fastpotify; running unguarded");
-            return Outcome::Only(unguarded());
-        }
-    };
-
-    let guard = unguarded();
-    let commands = Arc::clone(&guard.commands);
-    let now_playing = Arc::clone(&guard.now_playing);
-    let devices = Arc::clone(&guard.devices);
-    let waker = waker.clone();
-    let spawned = std::thread::Builder::new()
-        .name("fastpotify-instance".to_owned())
-        .spawn(move || serve(listener, &commands, &now_playing, &devices, &waker));
-    if let Err(error) = spawned {
-        log::warn!("cannot listen for other launches: {error}");
-    }
-    Outcome::Only(guard)
+/// and asks that one to come forward. A `hidden` start leaves the running
+/// one where it is.
+pub fn acquire(waker: &crate::backend::Waker, link: Option<&str>, hidden: bool) -> Outcome {
+    claim(&slot(), waker, link, hidden)
 }
 
-/// Answers control clients until the listener closes. One request line and
-/// one reply line per connection.
-#[cfg(not(target_os = "linux"))]
-fn serve(
-    listener: std::net::TcpListener,
-    commands: &std::sync::Mutex<Vec<ControlCommand>>,
-    now_playing: &std::sync::Mutex<String>,
-    devices: &std::sync::Mutex<String>,
+/// What a launch asks of the instance already running: open its link, stay
+/// where it is for a hidden start (a read it answers without coming
+/// forward), or show its window.
+fn launch_request(link: Option<&str>, hidden: bool) -> String {
+    match link {
+        Some(uri) => format!("open-link {uri}"),
+        None if hidden => "nowplaying".to_owned(),
+        None => "show".to_owned(),
+    }
+}
+
+fn claim(
+    slot: &fastframe_instance::Slot,
     waker: &crate::backend::Waker,
-) {
-    use std::io::Write;
-    use std::time::Duration;
+    link: Option<&str>,
+    hidden: bool,
+) -> Outcome {
+    let mut guard = Guard::unguarded();
+    let request = launch_request(link, hidden);
+    let handler = handler(
+        std::sync::Arc::clone(&guard.commands),
+        std::sync::Arc::clone(&guard.now_playing),
+        std::sync::Arc::clone(&guard.devices),
+        waker.clone(),
+    );
+    match slot.claim(&request, handler) {
+        fastframe_instance::Claim::First(slot) => {
+            guard._slot = Some(slot);
+            Outcome::Only(guard)
+        }
+        fastframe_instance::Claim::Running(_) => Outcome::Surfaced,
+        fastframe_instance::Claim::Declined => {
+            log::warn!("Spotifast is already running and declined this launch's request");
+            Outcome::Surfaced
+        }
+        fastframe_instance::Claim::Unanswered => {
+            log::warn!(
+                "Spotifast is already running but did not answer; not starting a second copy"
+            );
+            Outcome::Surfaced
+        }
+    }
+}
 
-    let queue = |command| {
-        commands
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(command);
-        waker.wake();
-    };
-
-    for mut stream in listener.incoming().flatten() {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-        let Some(line) = read_line(&mut stream) else {
-            continue;
+/// Answers one control request on the channel's thread: queues commands for
+/// the app and wakes it, and answers reads from the published snapshots.
+/// `None` refuses a request that is not ours, so the client gets no reply.
+fn handler(
+    commands: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>,
+    now_playing: std::sync::Arc<std::sync::Mutex<String>>,
+    devices: std::sync::Arc<std::sync::Mutex<String>>,
+    waker: crate::backend::Waker,
+) -> impl FnMut(&str) -> Option<String> + Send + 'static {
+    move |request| {
+        let queue = |command| {
+            commands
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(command);
+            waker.wake();
         };
-        match parse(&line) {
-            Some(Request::Command(command)) => {
-                let _ = stream.write_all(format!("{OK_REPLY}\n").as_bytes());
+        match parse(request)? {
+            Request::Command(command) => {
                 queue(command);
+                Some(OK_REPLY.to_owned())
             }
-            Some(Request::NowPlaying) => {
+            Request::NowPlaying => {
                 let snapshot = now_playing
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .clone();
-                let _ = stream.write_all(format!("{NOW_REPLY}{snapshot}\n").as_bytes());
+                Some(format!("{NOW_REPLY}{snapshot}"))
             }
-            Some(Request::Devices) => {
+            Request::Devices => {
                 let snapshot = devices.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let _ = stream.write_all(format!("{DEVICES_REPLY}{snapshot}\n").as_bytes());
                 // Return the current snapshot, then request a refresh for the
                 // next read. The app otherwise refreshes only while its picker
                 // is open.
                 queue(ControlCommand::RefreshDevices);
+                Some(format!("{DEVICES_REPLY}{snapshot}"))
             }
-            // Not our client; say nothing and hang up.
-            None => {}
         }
     }
 }
 
 /// A parsed request line: a command for the app, or a read the listener
 /// answers itself.
-#[cfg(not(target_os = "linux"))]
 enum Request {
     Command(ControlCommand),
     NowPlaying,
     Devices,
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Reads one request line, the channel having already checked and removed
+/// its `spotifast:` prefix.
 fn parse(line: &str) -> Option<Request> {
-    let verb = line.trim_end().strip_prefix(PREFIX)?;
+    let verb = line.trim_end();
     let (verb, argument) = match verb.split_once(' ') {
         Some((verb, argument)) => (verb, Some(argument.trim())),
         None => (verb, None),
     };
     let command = match (verb, argument) {
         ("show", None) => ControlCommand::Show,
+        ("reload-themes", None) => ControlCommand::ReloadThemes,
         ("playpause", None) => ControlCommand::PlayPause,
         ("play", None) => ControlCommand::Play,
         ("pause", None) => ControlCommand::Pause,
@@ -336,6 +332,16 @@ fn parse(line: &str) -> Option<Request> {
         }
         ("save-toggle", None) => ControlCommand::ToggleSaved,
         ("play-uri", Some(uri)) => ControlCommand::PlayUri(spotify_uri(uri)?),
+        ("play-search", Some(argument)) => {
+            let (kind, query) = argument.split_once(' ')?;
+            if !matches!(kind, "track" | "album" | "artist" | "playlist") {
+                return None;
+            }
+            ControlCommand::PlaySearch {
+                kind: kind.to_owned(),
+                query: search_text(query)?,
+            }
+        }
         ("open-link", Some(link)) => ControlCommand::OpenLink(crate::link::parse(link)?),
         ("transfer", Some(id)) => ControlCommand::Transfer(device_id(id)?),
         ("nowplaying", None) => return Some(Request::NowPlaying),
@@ -346,8 +352,7 @@ fn parse(line: &str) -> Option<Request> {
 }
 
 /// Validates the scheme, length, and characters of a Spotify URI received over
-/// the local control port.
-#[cfg(not(target_os = "linux"))]
+/// the control channel.
 fn spotify_uri(text: &str) -> Option<String> {
     let shaped = text.starts_with("spotify:")
         && text.len() <= 128
@@ -357,9 +362,17 @@ fn spotify_uri(text: &str) -> Option<String> {
     shaped.then(|| text.to_owned())
 }
 
+/// Words to search for, checked like the other free-text arguments: not
+/// empty, not long, and without control characters.
+fn search_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    let shaped =
+        !text.is_empty() && text.chars().count() <= 200 && !text.chars().any(char::is_control);
+    shaped.then(|| text.to_owned())
+}
+
 /// A Spotify Connect device id: the opaque hex-ish string the Web API hands
 /// out. Checked for the same reason as [`spotify_uri`].
-#[cfg(not(target_os = "linux"))]
 fn device_id(text: &str) -> Option<String> {
     let shaped = !text.is_empty()
         && text.len() <= 64
@@ -369,311 +382,7 @@ fn device_id(text: &str) -> Option<String> {
     shaped.then(|| text.to_owned())
 }
 
-/// Reads up to the first newline. A line too long to be one of ours, or any
-/// read error, disqualifies the client.
-#[cfg(not(target_os = "linux"))]
-fn read_line(stream: &mut std::net::TcpStream) -> Option<String> {
-    use std::io::Read;
-    let mut buffer = [0u8; 256];
-    let mut filled = 0;
-    loop {
-        if filled == buffer.len() {
-            return None;
-        }
-        match stream.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(read) => {
-                filled += read;
-                if buffer[..filled].contains(&b'\n') {
-                    break;
-                }
-            }
-            Err(_) => return None,
-        }
-    }
-    let line = buffer[..filled].split(|&byte| byte == b'\n').next()?;
-    String::from_utf8(line.to_vec()).ok()
-}
-
-/// What the running instance answers on its own name, for the launch the
-/// desktop makes when a Spotify link is opened.
-#[cfg(target_os = "linux")]
-struct Instance {
-    commands: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>>,
-    waker: crate::backend::Waker,
-}
-
-#[cfg(target_os = "linux")]
-#[zbus::interface(name = "rocks.fastpotify.Instance")]
-impl Instance {
-    /// Opens the page for a Spotify link and brings the window forward. A
-    /// link that is not a page the app has is refused, so the caller can
-    /// fall back to showing the window.
-    fn open(&self, link: &str) -> zbus::fdo::Result<()> {
-        let uri = crate::link::parse(link)
-            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("not a Spotify link: {link}")))?;
-        self.commands
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(ControlCommand::OpenLink(uri));
-        self.waker.wake();
-        Ok(())
-    }
-}
-
-/// Claims the running-instance role, or hands `link` (a canonical
-/// `spotify:` URI, see [`crate::link::parse`]) to the instance that has it
-/// and asks that one to come forward.
-#[cfg(target_os = "linux")]
-pub fn acquire(waker: &crate::backend::Waker, link: Option<&str>) -> Outcome {
-    use mpris_server::zbus::blocking::Connection;
-    use mpris_server::zbus::fdo::{RequestNameFlags, RequestNameReply};
-
-    let guard = |connection: Option<Connection>| Guard {
-        _connection: connection,
-        commands: Default::default(),
-        now_playing: std::sync::Arc::new(std::sync::Mutex::new(NOTHING_PLAYING.to_owned())),
-        devices: std::sync::Arc::new(std::sync::Mutex::new(NO_DEVICES.to_owned())),
-    };
-
-    let connection = match Connection::session() {
-        Ok(connection) => connection,
-        Err(error) => {
-            // No session bus at all: nothing to coordinate through, so run.
-            log::debug!("no session bus, running unguarded: {error}");
-            return Outcome::Only(guard(None));
-        }
-    };
-
-    // Holding the D-Bus name marks this process as the running instance.
-    // `NameTaken` is the normal second-launch result.
-    match connection.request_name_with_flags(INSTANCE_NAME, RequestNameFlags::DoNotQueue.into()) {
-        Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => {
-            let guard = guard(Some(connection.clone()));
-            // Links from later launches arrive on the name just taken.
-            // Registered before anything else, so a launch that follows
-            // this one closely finds it.
-            let instance = Instance {
-                commands: std::sync::Arc::clone(&guard.commands),
-                waker: waker.clone(),
-            };
-            if let Err(error) = serve_links(connection, instance) {
-                log::warn!("cannot take links from other launches: {error}");
-            }
-            Outcome::Only(guard)
-        }
-        Ok(_) | Err(mpris_server::zbus::Error::NameTaken) => {
-            if !raise_running_instance(&connection, link) {
-                log::warn!(
-                    "Fastpotify is already running but did not answer; not starting a second copy"
-                );
-            }
-            Outcome::Surfaced
-        }
-        Err(error) => {
-            log::warn!("cannot check for a running instance, starting anyway: {error}");
-            Outcome::Only(guard(None))
-        }
-    }
-}
-
-/// Serves `instance` on `connection` for the rest of the process, from a
-/// thread of its own: with tokio behind zbus, an interface's dispatch task
-/// runs on whichever runtime registers it, and outside one there is no
-/// registering it at all. This runtime is never dropped. Returns once the
-/// interface answers, or with what went wrong.
-#[cfg(target_os = "linux")]
-fn serve_links(connection: zbus::blocking::Connection, instance: Instance) -> Result<(), String> {
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("fastpotify-links".to_owned())
-        .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = ready_tx.send(Err(error.to_string()));
-                    return;
-                }
-            };
-            runtime.block_on(async move {
-                let served = connection
-                    .inner()
-                    .object_server()
-                    .at(INSTANCE_PATH, instance)
-                    .await;
-                match served {
-                    Ok(_) => {
-                        let _ = ready_tx.send(Ok(()));
-                        // The interface's dispatch task lives on this
-                        // runtime; so does the thread.
-                        std::future::pending::<()>().await;
-                    }
-                    Err(error) => {
-                        let _ = ready_tx.send(Err(error.to_string()));
-                    }
-                }
-            });
-        });
-    if let Err(error) = spawned {
-        return Err(error.to_string());
-    }
-    match ready_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(result) => result,
-        Err(_) => Err("the link interface did not come up in time".to_owned()),
-    }
-}
-
-/// Calls `Open` on the running instance, giving up after two seconds. An
-/// instance from before links has no object server on its connection, so
-/// it never answers at all, rather than with an error, and the bus's own
-/// timeout is a long twenty-five seconds. The call is made from a thread
-/// so a late answer costs the launch nothing.
-#[cfg(target_os = "linux")]
-fn open_in_running_instance(
-    connection: zbus::blocking::Connection,
-    uri: String,
-) -> Result<(), String> {
-    let (answer_tx, answer_rx) = std::sync::mpsc::channel();
-    let spawned = std::thread::Builder::new()
-        .name("fastpotify-open-link".to_owned())
-        .spawn(move || {
-            let opened = connection.call_method(
-                Some(INSTANCE_NAME),
-                INSTANCE_PATH,
-                Some("rocks.fastpotify.Instance"),
-                "Open",
-                &(uri.as_str(),),
-            );
-            let _ = answer_tx.send(opened.map(drop).map_err(|error| error.to_string()));
-        });
-    if let Err(error) = spawned {
-        return Err(error.to_string());
-    }
-    match answer_rx.recv_timeout(std::time::Duration::from_secs(2)) {
-        Ok(answer) => answer,
-        Err(_) => Err("no answer in time".to_owned()),
-    }
-}
-
-/// Hands `link` to the running instance, or without one asks it to show
-/// its window, retrying briefly because it may still be registering when
-/// this launch arrives. An instance from before links refuses `Open`, in
-/// which case its window is raised and the link dropped rather than the
-/// launch.
-#[cfg(target_os = "linux")]
-fn raise_running_instance(
-    connection: &mpris_server::zbus::blocking::Connection,
-    link: Option<&str>,
-) -> bool {
-    for attempt in 0..10 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-        }
-        if let Some(uri) = link {
-            match open_in_running_instance(connection.clone(), uri.to_owned()) {
-                Ok(()) => return true,
-                Err(error) => log::debug!("the running instance did not take the link: {error}"),
-            }
-        }
-        let raised = connection.call_method(
-            Some(MPRIS_NAME),
-            "/org/mpris/MediaPlayer2",
-            Some("org.mpris.MediaPlayer2"),
-            "Raise",
-            &(),
-        );
-        if raised.is_ok() {
-            if link.is_some() {
-                log::warn!("the running Fastpotify does not take links; asked it to show");
-            }
-            return true;
-        }
-    }
-    false
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod bus_tests {
-    use super::*;
-
-    #[test]
-    fn the_open_interface_accepts_only_spotify_links() {
-        let commands: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
-        let instance = Instance {
-            commands: std::sync::Arc::clone(&commands),
-            waker: crate::backend::Waker::default(),
-        };
-
-        let opened = instance.open("https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3?si=x");
-        let refused = instance.open("https://example.com/album/1DFixLWuPkv3KT3TnV35m3");
-
-        assert!(opened.is_ok(), "{opened:?}");
-        assert!(refused.is_err());
-        assert_eq!(
-            *commands.lock().expect("the queue"),
-            vec![ControlCommand::OpenLink(
-                "spotify:album:1DFixLWuPkv3KT3TnV35m3".to_owned()
-            )]
-        );
-    }
-
-    /// A usable session bus carries `Open` to the running instance. The
-    /// runner's bus is external test infrastructure, so bound the call and
-    /// leave the interface behaviour to the deterministic test above if it
-    /// accepts a connection but does not answer.
-    #[test]
-    fn a_link_reaches_the_running_instance_over_the_bus() {
-        // #given an instance answering on its own connection, not the
-        // shared name, so a Fastpotify already running is left alone
-        let Ok(server) = zbus::blocking::Connection::session() else {
-            eprintln!("no session bus here; nothing to test");
-            return;
-        };
-        let commands: std::sync::Arc<std::sync::Mutex<Vec<ControlCommand>>> = Default::default();
-        let instance = Instance {
-            commands: std::sync::Arc::clone(&commands),
-            waker: crate::backend::Waker::default(),
-        };
-        serve_links(server.clone(), instance).expect("the interface is served");
-        let name = server.unique_name().expect("a unique name").to_string();
-        let client = zbus::blocking::connection::Builder::session()
-            .expect("a session bus address")
-            .method_timeout(std::time::Duration::from_secs(2))
-            .build()
-            .expect("a second connection");
-
-        // #when
-        let opened = client.call_method(
-            Some(name.as_str()),
-            INSTANCE_PATH,
-            Some("rocks.fastpotify.Instance"),
-            "Open",
-            &("spotify:album:1DFixLWuPkv3KT3TnV35m3",),
-        );
-        if matches!(
-            &opened,
-            Err(zbus::Error::InputOutput(error))
-                if error.kind() == std::io::ErrorKind::TimedOut
-        ) {
-            eprintln!("the session bus did not answer in time; nothing to test");
-            return;
-        };
-
-        // #then
-        assert!(opened.is_ok(), "{opened:?}");
-        assert_eq!(
-            *commands.lock().expect("the queue"),
-            vec![ControlCommand::OpenLink(
-                "spotify:album:1DFixLWuPkv3KT3TnV35m3".to_owned()
-            )]
-        );
-    }
-}
-
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::player::RepeatMode;
@@ -688,104 +397,105 @@ mod tests {
     #[test]
     fn parses_every_control_verb() {
         // #given / #when / #then
-        assert_eq!(command("fastpotify:show\n"), Some(ControlCommand::Show));
+        assert_eq!(command("show\n"), Some(ControlCommand::Show));
+        assert_eq!(command("reload-themes"), Some(ControlCommand::ReloadThemes));
+        assert_eq!(command("reload-themes extra"), None);
+        assert_eq!(command("playpause"), Some(ControlCommand::PlayPause));
+        assert_eq!(command("play"), Some(ControlCommand::Play));
+        assert_eq!(command("pause"), Some(ControlCommand::Pause));
+        assert_eq!(command("next"), Some(ControlCommand::Next));
+        assert_eq!(command("previous"), Some(ControlCommand::Previous));
         assert_eq!(
-            command("fastpotify:playpause"),
-            Some(ControlCommand::PlayPause)
-        );
-        assert_eq!(command("fastpotify:play"), Some(ControlCommand::Play));
-        assert_eq!(command("fastpotify:pause"), Some(ControlCommand::Pause));
-        assert_eq!(command("fastpotify:next"), Some(ControlCommand::Next));
-        assert_eq!(
-            command("fastpotify:previous"),
-            Some(ControlCommand::Previous)
-        );
-        assert_eq!(
-            command("fastpotify:seek-by -10000"),
+            command("seek-by -10000"),
             Some(ControlCommand::SeekBy(-10_000))
         );
+        assert_eq!(command("volume-by +5"), Some(ControlCommand::VolumeBy(5)));
         assert_eq!(
-            command("fastpotify:volume-by +5"),
-            Some(ControlCommand::VolumeBy(5))
-        );
-        assert_eq!(
-            command("fastpotify:volume-set 40"),
+            command("volume-set 40"),
             Some(ControlCommand::SetVolume(40))
         );
-        assert_eq!(command("fastpotify:mute"), Some(ControlCommand::ToggleMute));
+        assert_eq!(command("mute"), Some(ControlCommand::ToggleMute));
+        assert_eq!(command("shuffle"), Some(ControlCommand::ToggleShuffle));
+        assert_eq!(command("repeat"), Some(ControlCommand::CycleRepeat));
         assert_eq!(
-            command("fastpotify:shuffle"),
-            Some(ControlCommand::ToggleShuffle)
-        );
-        assert_eq!(
-            command("fastpotify:repeat"),
-            Some(ControlCommand::CycleRepeat)
-        );
-        assert_eq!(
-            command("fastpotify:shuffle-set on"),
+            command("shuffle-set on"),
             Some(ControlCommand::SetShuffle(true))
         );
         assert_eq!(
-            command("fastpotify:shuffle-set off"),
+            command("shuffle-set off"),
             Some(ControlCommand::SetShuffle(false))
         );
         assert_eq!(
-            command("fastpotify:repeat-set track"),
+            command("repeat-set track"),
             Some(ControlCommand::SetRepeat(RepeatMode::Track))
         );
         assert_eq!(
-            command("fastpotify:repeat-set context"),
+            command("repeat-set context"),
             Some(ControlCommand::SetRepeat(RepeatMode::Context))
         );
         assert_eq!(
-            command("fastpotify:repeat-set off"),
+            command("repeat-set off"),
             Some(ControlCommand::SetRepeat(RepeatMode::Off))
         );
         assert_eq!(
-            command("fastpotify:seek-to 90000"),
+            command("seek-to 90000"),
             Some(ControlCommand::SeekTo(90_000))
         );
+        assert_eq!(command("save-toggle"), Some(ControlCommand::ToggleSaved));
         assert_eq!(
-            command("fastpotify:save-toggle"),
-            Some(ControlCommand::ToggleSaved)
-        );
-        assert_eq!(
-            command("fastpotify:play-uri spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),
+            command("play-uri spotify:playlist:37i9dQZF1DXcBWIGoYBM5M"),
             Some(ControlCommand::PlayUri(
                 "spotify:playlist:37i9dQZF1DXcBWIGoYBM5M".to_owned()
             ))
         );
         assert_eq!(
-            command("fastpotify:transfer a1b2c3d4e5"),
+            command("transfer a1b2c3d4e5"),
             Some(ControlCommand::Transfer("a1b2c3d4e5".to_owned()))
         );
         // A link arrives in whatever shape the desktop had it and leaves
         // as the one URI the app navigates by.
         assert_eq!(
-            command(
-                "fastpotify:open-link https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3?si=x"
-            ),
+            command("open-link https://open.spotify.com/album/1DFixLWuPkv3KT3TnV35m3?si=x"),
             Some(ControlCommand::OpenLink(
                 "spotify:album:1DFixLWuPkv3KT3TnV35m3".to_owned()
             ))
         );
-        assert!(matches!(
-            parse("fastpotify:nowplaying"),
-            Some(Request::NowPlaying)
-        ));
-        assert!(matches!(
-            parse("fastpotify:devices"),
-            Some(Request::Devices)
-        ));
+        assert!(matches!(parse("nowplaying"), Some(Request::NowPlaying)));
+        assert!(matches!(parse("devices"), Some(Request::Devices)));
+    }
+
+    #[test]
+    fn play_search_carries_its_kind_and_words() {
+        assert_eq!(
+            command("play-search track danza rota soda stereo"),
+            Some(ControlCommand::PlaySearch {
+                kind: "track".into(),
+                query: "danza rota soda stereo".into(),
+            })
+        );
+        assert_eq!(
+            command("play-search artist Soda Stereo"),
+            Some(ControlCommand::PlaySearch {
+                kind: "artist".into(),
+                query: "Soda Stereo".into(),
+            })
+        );
+        assert_eq!(command("play-search track"), None);
+        assert_eq!(command("play-search song danza rota"), None);
+        assert_eq!(command("play-search track \u{7}bell"), None);
+        assert_eq!(
+            command(&format!("play-search track {}", "a".repeat(201))),
+            None
+        );
     }
 
     #[test]
     fn rejects_lines_that_are_not_ours() {
         assert!(parse("GET / HTTP/1.1").is_none());
-        assert!(parse("fastpotify:frobnicate").is_none());
-        assert!(parse("fastpotify:seek-by soon").is_none());
-        assert!(parse("fastpotify:volume-set 999").is_none());
-        assert!(parse("fastpotify:next please").is_none());
+        assert!(parse("frobnicate").is_none());
+        assert!(parse("seek-by soon").is_none());
+        assert!(parse("volume-set 999").is_none());
+        assert!(parse("next please").is_none());
         assert!(parse("").is_none());
     }
 
@@ -793,57 +503,134 @@ mod tests {
     #[test]
     fn refuses_arguments_that_are_not_shaped_like_spotifys_own() {
         // #given / #when / #then
-        assert!(command("fastpotify:play-uri http://example.com/pwn").is_none());
-        assert!(command("fastpotify:play-uri spotify:track:a b").is_none());
-        assert!(command("fastpotify:play-uri ../../etc/passwd").is_none());
-        assert!(command("fastpotify:play-uri").is_none());
-        assert!(command(&format!("fastpotify:play-uri spotify:{}", "x".repeat(200))).is_none());
-        assert!(command("fastpotify:transfer ../secrets").is_none());
-        assert!(command("fastpotify:transfer").is_none());
-        assert!(command("fastpotify:open-link https://example.com/track/x").is_none());
-        assert!(command("fastpotify:open-link spotify:user:someone").is_none());
-        assert!(command("fastpotify:open-link").is_none());
+        assert!(command("play-uri http://example.com/pwn").is_none());
+        assert!(command("play-uri spotify:track:a b").is_none());
+        assert!(command("play-uri ../../etc/passwd").is_none());
+        assert!(command("play-uri").is_none());
+        assert!(command(&format!("play-uri spotify:{}", "x".repeat(200))).is_none());
+        assert!(command("transfer ../secrets").is_none());
+        assert!(command("transfer").is_none());
+        assert!(command("open-link https://example.com/track/x").is_none());
+        assert!(command("open-link spotify:user:someone").is_none());
+        assert!(command("open-link").is_none());
         // A word that is not one of the three is refused rather than read
         // as `off`, which is what `RepeatMode::from_api` would have done.
-        assert!(command("fastpotify:repeat-set sometimes").is_none());
-        assert!(command("fastpotify:shuffle-set maybe").is_none());
-        assert!(command("fastpotify:seek-to -1").is_none());
+        assert!(command("repeat-set sometimes").is_none());
+        assert!(command("shuffle-set maybe").is_none());
+        assert!(command("seek-to -1").is_none());
     }
 
-    /// Socket commands reach the queue and reads return published snapshots.
-    #[test]
-    fn a_client_reaches_the_command_queue_and_the_snapshot() {
-        use std::net::{Ipv4Addr, TcpListener};
-        use std::sync::{Arc, Mutex};
+    /// A slot of its own in a throwaway directory, so a Spotifast already
+    /// running on this machine is left alone.
+    fn test_slot(name: &str) -> (fastframe_instance::Slot, std::path::PathBuf) {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-instance-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (fastframe_instance::Slot::at(&dir, NAME), dir)
+    }
 
+    /// The first launch holds the slot; a second one hands its link over
+    /// and does not start.
+    #[test]
+    fn a_second_launch_hands_its_link_to_the_first() {
         // #given
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
-        let port = listener.local_addr().expect("a bound address").port();
-        let commands: Arc<Mutex<Vec<ControlCommand>>> = Default::default();
-        let now_playing = Arc::new(Mutex::new("playing\tGo\tThe Band".to_owned()));
-        let devices = Arc::new(Mutex::new(
-            r#"[{"id":"abc","name":"Kitchen","kind":"Speaker","active":true}]"#.to_owned(),
-        ));
-        let served = {
-            let commands = Arc::clone(&commands);
-            let now_playing = Arc::clone(&now_playing);
-            let devices = Arc::clone(&devices);
-            let waker = crate::backend::Waker::default();
-            std::thread::spawn(move || serve(listener, &commands, &now_playing, &devices, &waker))
+        let (slot, dir) = test_slot("second-launch");
+        let waker = crate::backend::Waker::default();
+        let Outcome::Only(first) = claim(&slot, &waker, None, false) else {
+            panic!("the first launch runs");
         };
 
         // #when
-        let accepted = send_to(port, "next").expect("a reply");
-        let volume = send_to(port, "volume-by -5").expect("a reply");
-        let liked = send_to(port, "save-toggle").expect("a reply");
-        let snapshot = send_to(port, "nowplaying").expect("a reply");
-        let listed = send_to(port, "devices").expect("a reply");
-        let refused = send_to(port, "frobnicate");
+        let second = claim(
+            &slot,
+            &waker,
+            Some("spotify:album:1DFixLWuPkv3KT3TnV35m3"),
+            false,
+        );
+
+        // #then
+        assert!(matches!(second, Outcome::Surfaced));
+        assert_eq!(
+            *first.commands.lock().expect("the queue"),
+            vec![ControlCommand::OpenLink(
+                "spotify:album:1DFixLWuPkv3KT3TnV35m3".to_owned()
+            )]
+        );
+        drop(first);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A start at login in the tray finds Spotifast already running (the
+    /// person opened it first) and ends without bringing it forward.
+    #[test]
+    fn a_hidden_second_launch_leaves_the_first_where_it_is() {
+        // #given
+        let (slot, dir) = test_slot("hidden-launch");
+        let waker = crate::backend::Waker::default();
+        let Outcome::Only(first) = claim(&slot, &waker, None, false) else {
+            panic!("the first launch runs");
+        };
+
+        // #when
+        let second = claim(&slot, &waker, None, true);
+
+        // #then
+        assert!(matches!(second, Outcome::Surfaced));
+        assert!(first.commands.lock().expect("the queue").is_empty());
+        drop(first);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_launch_asks_for_its_link_the_window_or_nothing() {
+        assert_eq!(
+            launch_request(Some("spotify:track:1"), true),
+            "open-link spotify:track:1",
+            "a link is to be seen, even from a hidden start"
+        );
+        assert_eq!(launch_request(None, false), "show");
+        assert_eq!(launch_request(None, true), "nowplaying");
+    }
+
+    /// Commands reach the queue and reads return the published snapshots.
+    #[test]
+    fn a_client_reaches_the_command_queue_and_the_snapshot() {
+        // #given
+        let (slot, dir) = test_slot("round-trip");
+        let Outcome::Only(guard) = claim(&slot, &crate::backend::Waker::default(), None, false)
+        else {
+            panic!("the slot is free");
+        };
+        *guard.now_playing.lock().expect("the snapshot") = "playing\tGo\tThe Band".to_owned();
+        *guard.devices.lock().expect("the snapshot") =
+            r#"[{"id":"abc","name":"Kitchen","kind":"Speaker","active":true}]"#.to_owned();
+        let send = |verb: &str| slot.send(verb).and_then(|line| reply(&line));
+
+        // #when
+        let accepted = send("next").expect("a reply");
+        let volume = send("volume-by -5").expect("a reply");
+        let liked = send("save-toggle").expect("a reply");
+        let snapshot = send("nowplaying").expect("a reply");
+        let listed = send("devices").expect("a reply");
+        let search =
+            crate::link::parse(&format!("spotify:search:{}", "東京の音楽 ".repeat(20))).unwrap();
+        assert!(search.len() > 256, "exercise a long search link");
+        let searched = send(&format!("open-link {search}")).expect("a search reply");
+        let oversized = send(&format!(
+            "open-link spotify:search:{}",
+            "x".repeat(16 * 1024)
+        ));
+        let refused = send("frobnicate");
 
         // #then
         assert!(matches!(accepted, Reply::Ok));
         assert!(matches!(volume, Reply::Ok));
         assert!(matches!(liked, Reply::Ok));
+        assert!(matches!(searched, Reply::Ok));
+        assert!(
+            oversized.is_err(),
+            "requests beyond the size bound are refused"
+        );
         match snapshot {
             Reply::NowPlaying(line) => assert_eq!(line, "playing\tGo\tThe Band"),
             _ => panic!("nowplaying answered with something else"),
@@ -858,15 +645,16 @@ mod tests {
         // Reading the devices also asks the app to look again, so the next
         // read is fresh.
         assert_eq!(
-            *commands.lock().expect("the queue"),
+            *guard.commands.lock().expect("the queue"),
             vec![
                 ControlCommand::Next,
                 ControlCommand::VolumeBy(-5),
                 ControlCommand::ToggleSaved,
                 ControlCommand::RefreshDevices,
+                ControlCommand::OpenLink(search),
             ]
         );
-
-        drop(served);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

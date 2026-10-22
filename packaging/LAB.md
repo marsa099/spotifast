@@ -35,8 +35,14 @@ fastpotify-lab-update /path/to/task-worktree
 Restart Lab after a successful update. Updates do not launch or close windows,
 change settings, or copy credentials again. The original app remains separate.
 
-Nix prepares an isolated source snapshot using the **same Lab identity patches**
-as the checkpoint package. Tracked working-tree edits are included; newly added
+Current upstream is named **Spotifast**. Development builds use
+`lab-dev-identity.nix` to keep the existing `fastpotify-lab` launcher, window ID
+and XDG profile paths, with a separate `fastpotify_lab` MPRIS identity. The
+legacy pinned checkpoint still uses its original `lab.nix` identity patches.
+After updating from an older checkout, reinstall the small development launcher
+using the command above before using `fastpotify-lab-update`.
+
+Nix prepares an isolated source snapshot with these Lab identity patches. Tracked working-tree edits are included; newly added
 source files must be staged so the Git flake includes them. The checkout itself
 is never patched or built into. Cargo uses a stable private source directory and
 persistent target cache, with unchanged file timestamps preserved. Library tests
@@ -55,6 +61,9 @@ builds and their per-generation Nix environment GC roots live under
 so clearing compilation caches does not remove the installed app or its libraries.
 Only checked builds replace the `current` symlink, atomically; `previous` retains
 the preceding successful generation. Failed updates keep the current build.
+Each generation's `build-info` records the original checkout path, the exact
+Nix source snapshot and the UTC build time. Updating repository source alone
+does not rebuild or replace an installed generation.
 
 Keep the lower-priority checkpoint package installed as a fallback. Removing the
 `fastpotify-lab-dev` profile entry restores that launcher without deleting Lab's
@@ -73,7 +82,7 @@ bash packaging/test-update-lab-dev.sh
 - Credential storage retains the existing Secret Service service name but uses
   a different profile key, derived from the Lab state path. Copying settings
   alone does **not** copy a current version's protected sign-in credentials.
-- Window identity, single-instance D-Bus name, MPRIS name, tray identity and
+- Window identity, single-instance channel, MPRIS name, tray identity and
   desktop filename are separate. Lab does not register Spotify URI associations.
 - The default Spotify Connect device name is **Fastpotify Lab**. Keep it distinct
   when importing settings: the Connect device ID is derived from that name.

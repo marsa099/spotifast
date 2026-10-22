@@ -18,23 +18,27 @@ the shortcut again, to return to the main window.
 Drop a `.wsz` file on either window to install and use it. Settings lists the
 installed skins and can open the skins folder.
 
-On `main`, for the release after 0.7.1, unpacked skins can keep their files
-inside nested folders, up to eight levels below the selected skin folder.
-File names are matched without regard to case. If a name appears more than
-once, the copy closest to the selected folder wins; ties use folder and file
-name order. Symbolic links are skipped.
+Choose **Random**, first in that list, to get a different skin each time you
+switch to the mini player, never the same one twice in a row. Settings says
+which skin it picked, and choosing a skin yourself turns Random off.
 
-The mini player uses whole-number scaling to keep pixels sharp. Right-click
-the title bar, or click **O**, to choose 1x to 4x and set always-on-top. **D**
-toggles double size and **A** toggles always-on-top. Fastpotify remembers the
-window position.
+You can also use an unpacked skin folder. Spotifast finds skin files inside
+its subfolders, up to eight folders deep, so you do not need to move them all
+into one folder.
 
-Non-rectangular skins use `region.txt` for transparent areas. Winamp 3 and 5
-skins use a different format and are not supported.
+Right-click the title bar, or click **O**, to choose a size from 1x to 4x.
+Each size keeps the classic pixels sharp. The same menu can keep the player
+above other windows. **D** toggles double size and **A** toggles always-on-top.
+Spotifast remembers the window position where your desktop allows it.
+
+Skins can have transparent areas and shapes other than rectangles. Modern
+Winamp 3 and 5 skin formats are not supported; choose classic Winamp 2 skins.
 
 ## Main controls
 
-Most controls match Winamp. These work differently:
+Most controls match Winamp. As in Winamp, Play on a song that is already
+playing starts it again from the beginning; Pause pauses. These work
+differently:
 
 - **Stop** pauses and rewinds.
 - **I** opens the playing album in the main window.
@@ -50,13 +54,14 @@ playlist and equalizer have their own shade buttons.
 
 Switching to the main window and back keeps the shade modes and restores the
 mini player's own position. It does not inherit the main window's fullscreen
-or maximized state. Wayland compositors choose window positions themselves
-and may ignore the saved position.
+or maximized state. On Linux desktops using Wayland, the desktop chooses where
+windows appear and may ignore the saved position.
 
-The left display shows the spectrum analyser. Click it to switch to the
-oscilloscope, then off. You can also use the **V** menu. The visualiser uses
-local audio after the equalizer and before volume, so it still moves at zero
-volume. It stays flat when another device is playing.
+The left display shows bars that react to the sound (a spectrum analyser).
+Click it to switch to a moving sound wave (an oscilloscope), then off.
+You can also use the **V** menu. Changes to the equalizer affect the picture;
+turning down the volume does not, even at zero. The display reacts only to
+music playing on this computer.
 
 ## Playlist
 
@@ -68,13 +73,21 @@ drag the lower-right corner to resize the window. Use X or **PL** to close it.
 - **SEL** selects rows.
 - **MISC** opens song, artist, and album pages.
 - **LIST OPTS** starts one of your playlists or saves the queue as a new one.
-- **REM → Remove all** clears your queued songs when this computer is playing.
+- **REM → Remove selected** takes the selected songs you queued out of the
+  queue, and **REM → Remove all** clears every song you queued. Both work when
+  this computer is playing. Songs from the playing album or playlist stay.
 
-Spotify does not let third-party apps remove one song from the queue. Notices
-from the main window scroll through the mini player's text display.
+Notices from the main window scroll through the mini player's text display.
 
 ## Equalizer
 
 **EQ** opens the ten-band equalizer. It affects playback on this computer, not
 other Spotify Connect devices. The preamp ranges from -12 to 12 dB. **AUTO**
 resets all bands. The same controls and presets are in Settings.
+
+To keep your own curve, such as a headphone correction, type a name under the
+presets in **Settings → Equalizer** and choose **Save preset**. It stores the
+preamp and the ten bands, and appears after the built-in presets in Settings
+and in the mini player's **PRESETS** menu. Saving under a name you already
+used replaces that preset. While a saved preset is in use, **Delete** beside
+**Save preset** removes it; the sound stays as it is.

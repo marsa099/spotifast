@@ -1,11 +1,11 @@
-# Fastpotify agent guide
+# Spotifast agent guide
 
 Follow `CONTRIBUTING.md`; it is the canonical product and contribution policy.
 These instructions add implementation constraints for coding agents.
 
 ## Product boundaries
 
-- Keep Fastpotify a small native Spotify client. Do not add a browser engine,
+- Keep Spotifast a small native Spotify client. Do not add a browser engine,
   telemetry, a hosted backend, or alternate sources for Spotify audio.
 - Playback capabilities come from librespot. Do not advertise or implement a
   capability merely because its name appears in a protobuf or enum. In
@@ -13,6 +13,8 @@ These instructions add implementation constraints for coding agents.
   lawful support first lands upstream.
 - Do not broaden a task into adjacent features or a general refactor. Preserve
   existing user behaviour unless the task explicitly changes it.
+- Do not add a setting without the maintainer's approval in the issue first;
+  prefer a good default, a shortcut or a command (`CONTRIBUTING.md`, Settings).
 
 ## Architecture
 
@@ -21,12 +23,30 @@ These instructions add implementation constraints for coding agents.
 - Network and playback work belongs on the runtime in `src/backend.rs` or in
   the player engine in `src/player.rs`, never as blocking work on the UI
   thread.
+- File writes that wait for the disk (anything through `fastframe_file`)
+  never run on the UI thread: encode there and hand the bytes to the app's
+  `fastframe_file::Writer`. fastframe_file's guard panics in debug builds.
 - Keep platform integrations behind target-specific modules or `cfg` blocks.
   A fix for one platform must keep the other two targets compiling.
 - Settings and state files must remain readable, backward compatible, and
   atomically written. Never log credentials or authorization responses.
 - Prefer existing dependencies. Explain any new crate in `Cargo.toml` next to
   the dependency when the reason is not obvious.
+- For dependency fixes, use a fork under `github.com/crmne/` pinned to a
+  commit and contribute the fix upstream. Only the maintainer creates those
+  forks; in a contributor's pull request, send the fix upstream and ask for it
+  to be carried. Use the fork until a release includes the fix; do not copy
+  dependency source into this repository. Never point a dependency at any other
+  fork or source (see Pull requests below):
+  `.github/scripts/check-dependency-sources.py` fails CI on one.
+- egui and winit come from forks shared with ZapFast, RekordFlash and TonePush
+  (crmne/egui apps-0.36.2, crmne/winit apps-0.30); move all their crates to a
+  new revision together. On Wayland, eframe from that fork paces frames by
+  the compositor's frame callbacks instead of a vsync swap, so a hidden window
+  cannot freeze the app (#266). Do not add a vsync decision of our own.
+- The egui fork shapes right-to-left runs in their own direction but leaves
+  them in logical order. Pass logical text to `crate::bidi`, which reorders
+  the laid-out runs; never reorder the string before layout.
 
 Read `docs/_reference/how-it-connects.md` before changing authentication,
 Spotify requests, Connect, credential storage, or network behaviour. Read
@@ -92,6 +112,48 @@ picture. Zero volume still dances.
   approval of changed appearance or interaction.
 - Inspect before-and-after evidence at representative window sizes and in both
   light and dark themes. If that evidence is missing, request it.
+- Keep visual evidence in the pull request, in the format under "Visual
+  reviews" in `CONTRIBUTING.md`: matching captures attached to the description
+  or a comment, Before and After side by side for both themes at narrow and
+  normal sizes, and relevant interaction states. Attach an interactive
+  comparison, or the index for a batch (PR numbers, a selector, Previous/Next
+  controls and links to individual comparisons), as a self-contained HTML
+  file, or publish it outside the repository, and link it. Never commit
+  captures, comparison pages or recordings:
+  `.github/scripts/check-review-evidence.py` fails CI on them.
+- Record approval and requested adjustments by PR number in the triage ledger.
+  Keep visual approval separate from outstanding implementation or test gates.
+  Do not ask again for unchanged approved scope after a rebase. A concrete
+  requested adjustment is authorization to make that adjustment and update its
+  evidence; ask again only for scope beyond the approval or request.
+
+<!-- github-automation: pull-requests -->
+## Pull requests
+
+This section is maintained account-wide by
+[crmne/github-automation](https://github.com/crmne/github-automation) and is
+replaced when that policy changes. Do not edit it here. If it does not fit this
+repository, say so in a review or issue, and put repository-specific rules in a
+separate section, which takes precedence.
+
+Review evidence stays out of the repository. Before-and-after screenshots,
+captures, comparison pages, recordings, and anything else made to show
+reviewers a change go in the pull request description or its comments: attach
+the files there, or link a page published elsewhere. Only media the project
+itself uses, such as documentation figures, release-note images, and app
+assets, belongs in the repository.
+
+Dependencies come from their package registry, such as crates.io, RubyGems, or
+npm, or from repositories the maintainer controls, under `github.com/crmne/`
+or this repository's own organization. A git dependency, or a patch, override,
+or replace entry, may point only at such a repository, and adding or changing
+one needs the maintainer's explicit approval. Never point a dependency at a
+contributor's fork or any other source the maintainer does not control. When a
+dependency needs a fix, send it upstream and ask the maintainer to carry it in
+a fork they control until a release includes it.
+
+Reviewers treat either problem in a pull request as a blocker.
+<!-- /github-automation: pull-requests -->
 
 ## Branches
 
@@ -108,6 +170,33 @@ local commits if needed. Before pushing, verify that the commits being added
 contain no merge commits. Rewriting published history requires explicit
 maintainer approval and an exact force-with-lease guard; keep a recovery ref.
 
+## Disk use
+
+Builds go through [mbx](https://mr-boxington.jdx.dev), enabled for mise users
+by `mise.toml` (run `mise trust` once in each new checkout or worktree, or
+mise refuses to run `cargo` there). It keeps compiled work in one shared
+store, places each checkout's `target/` under a disk budget, and collects old
+outputs on its own. Plain `cargo` still works for contributors who do not use
+mise or mbx.
+
+- Give each worktree and each parallel agent its own target directory. A
+  worktree's own `target/` is enough, and mbx manages it; a second build in
+  the same checkout uses `CARGO_TARGET_DIR=target/<name>`, which stays inside
+  the managed target. Never point builds at a shared target directory: Cargo's
+  lock serializes them, one worktree's test run can execute another's binary,
+  and the store already shares compiled outputs.
+- Never vary `codegen-units` or other compiler flags per agent. Each variant
+  is a separate cache entry and fills the disk.
+- Do not `cargo clean` to save space. `mbx gc --dry-run` previews collection
+  and `mbx gc` runs it now; `mbx cache stats` shows what is held.
+- When a build is colder than expected, `mbx explain --last` says what missed
+  the cache and why.
+- Never put build output or large scratch files in `/tmp`. It is a small
+  in-memory filesystem with a per-user quota, and filling it breaks every
+  shell on the machine.
+- Delete one-off QA, packaging, and release-validation directories (under
+  `.cache/` or `~/.cache/`) once their result is recorded.
+
 ## Definition of done
 
 - Add focused regression tests for changed behaviour. Use the `demo` feature
@@ -123,7 +212,7 @@ maintainer approval and an exact force-with-lease guard; keep a recovery ref.
 ## Local Lab iteration in this fork
 
 Use the cached development workflow in `packaging/LAB.md` for ordinary local
-UI iterations. From a task worktree, run `fastpotify-lab-update "$PWD"`, or
+UI iterations. From a task worktree, run
 `bash packaging/update-lab-dev.sh "$PWD"`. It checks and builds isolated Lab
 sources with a persistent Cargo cache, then atomically selects the new binary.
 The installed launcher, settings, and credential profile stay the same.
@@ -144,22 +233,26 @@ A release is not the tag alone. Do these in order:
    only the package version changed. Verify `nix build .#default` locally or
    in CI. Wait for every required CI job on the release commit before tagging.
    Commit and push this before the tag so the binaries report the right
-   version.
+   version. Include written notes in `packaging/release-notes/vVERSION.md`
+   so the release publishes the real description immediately.
 2. Push the `v*` tag, which triggers the release workflow. Wait for every
-   required artifact and `checksums.txt`, then replace the generated notes
-   with written ones.
+   required artifact and `checksums.txt`, then verify the published written
+   notes, screenshot and download links. Never publish generated placeholder notes.
 3. A prerelease stops here. Keep the stable version current on the website,
    Homebrew, and AUR. The prerelease remains available from GitHub's releases
    page.
 4. For a stable release, only after the GitHub release exists, update
-   `docs/_config.yml` `fastpotify_version` and
+   `docs/_config.yml` `spotifast_version` and
    `docs/_data/versions.yml`. The selector carries only the latest stable
    version: replace its version entry, make it `current`, and point it at
    `/download/`. Do not retain older version entries; they remain available
    through the Changelog link. Never make the download page point at files
    that do not exist yet.
 5. Update the Homebrew cask in the maintainer's tap and the AUR package from
-   the release's `checksums.txt`.
+   the release's `checksums.txt`. The packaging workflow handles configured
+   destinations when `PUBLISH_HOMEBREW` and `PUBLISH_AUR` are enabled. Otherwise
+   use the in-repository packaging CLI to prepare, review and publish them;
+   see `PACKAGING.md`. Native package validation remains required.
 
 Before writing release notes, read the previous two stable releases and match
 their style. Start with a short plain-language summary, use `New` and `Fixed`

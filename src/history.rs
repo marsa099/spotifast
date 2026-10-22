@@ -1,12 +1,14 @@
 //! Local play history.
 //!
-//! Spotify does not record playback from librespot clients. Fastpotify stores
+//! Spotify does not record playback from librespot clients. Spotifast stores
 //! local plays and merges them with `/me/player/recently-played`, which covers
 //! other devices. A track counts only after enough listening time, so skips do
 //! not fill the history.
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::api::models::{Album, Image, PlayHistory, Track};
 
@@ -16,7 +18,8 @@ const COUNTS_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 /// Maximum number of stored local plays.
 const KEPT: usize = 500;
 
-/// Matching plays within this many seconds are treated as duplicates.
+/// A play made here and a play of the same song Spotify reports within this
+/// many seconds of it are the same play.
 const SAME_PLAY: i64 = 60;
 
 /// When a song has been listened to long enough to count.
@@ -33,6 +36,8 @@ pub struct History {
     plays: Vec<PlayHistory>,
     /// Set when the in-memory list differs from the file.
     dirty: bool,
+    /// Set by the file writer when a handed-over write failed.
+    failed: Arc<AtomicBool>,
 }
 
 impl History {
@@ -44,7 +49,7 @@ impl History {
             .unwrap_or_default();
         Self {
             plays,
-            dirty: false,
+            ..Self::default()
         }
     }
 
@@ -56,22 +61,36 @@ impl History {
         self.plays.is_empty()
     }
 
-    /// Writes the history if it changed since the last save.
-    pub fn save(&mut self, path: &Path) {
-        if !self.dirty {
+    /// Whether the file may not hold the plays in memory.
+    pub fn needs_save(&self) -> bool {
+        self.dirty || self.failed.load(Ordering::SeqCst)
+    }
+
+    /// Hands the history to `files` if it changed since the last save. A
+    /// write that fails leaves it to be written by the next save.
+    pub fn save(&mut self, files: &fastframe_file::Writer, path: &Path) {
+        let failed = self.failed.swap(false, Ordering::SeqCst);
+        if !std::mem::take(&mut self.dirty) && !failed {
             return;
-        }
-        self.dirty = false;
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
         }
         match serde_json::to_string(&self.plays) {
             Ok(text) => {
-                if let Err(error) = std::fs::write(path, text) {
-                    log::warn!("could not write the play history: {error}");
-                }
+                // Replaced whole, as settings are: the history is written
+                // when the session ends, and a shutdown that cuts the write
+                // short must not leave half a file behind. The writer waits
+                // until the new file and its move reach the disk, off the UI
+                // thread, so a power cut cannot leave an empty history.
+                // What someone listened to is theirs: on Unix the file is
+                // readable by its owner only, whatever the old one allowed.
+                let failed = self.failed.clone();
+                files.write_or(path, text, fastframe_file::Access::Private, move || {
+                    failed.store(true, Ordering::SeqCst)
+                });
             }
-            Err(error) => log::warn!("could not write the play history: {error}"),
+            Err(error) => {
+                self.dirty = true;
+                log::warn!("could not write the play history: {error}");
+            }
         }
     }
 
@@ -129,23 +148,44 @@ pub fn played_track(now: &crate::app::NowPlaying) -> Track {
 
 /// Merges local and Spotify history, newest first.
 ///
-/// Matching plays within the duplicate window are deduplicated. Entries
-/// without a timestamp sort to the end.
+/// A play Spotify reports within the duplicate window of one made here is
+/// that same play, and is shown once. Plays from one source are never
+/// merged with each other: each is its own listen, however close together
+/// they start. Entries without a timestamp sort to the end.
 pub fn merged(local: &[PlayHistory], remote: &[PlayHistory]) -> Vec<PlayHistory> {
-    let mut seen: HashMap<String, Vec<i64>> = HashMap::new();
-    let mut out: Vec<(Option<i64>, PlayHistory)> = Vec::new();
-    for play in local.iter().chain(remote) {
-        let at = play
-            .played_at
+    let time = |play: &PlayHistory| {
+        play.played_at
             .as_deref()
             .and_then(|at| at.parse::<jiff::Timestamp>().ok())
-            .map(|at| at.as_second());
+            .map(|at| at.as_second())
+    };
+    // The plays made here that no report from Spotify has matched yet.
+    let mut unmatched: HashMap<&str, Vec<i64>> = HashMap::new();
+    let mut out: Vec<(Option<i64>, PlayHistory)> = Vec::new();
+    for play in local {
+        let at = time(play);
         if let Some(at) = at {
-            let times = seen.entry(play.track.uri.clone()).or_default();
-            if times.iter().any(|held| (held - at).abs() <= SAME_PLAY) {
-                continue;
-            }
-            times.push(at);
+            unmatched
+                .entry(play.track.uri.as_str())
+                .or_default()
+                .push(at);
+        }
+        out.push((at, play.clone()));
+    }
+    for play in remote {
+        let at = time(play);
+        // Each play made here stands for at most one report: the closest.
+        if let Some(at) = at
+            && let Some(times) = unmatched.get_mut(play.track.uri.as_str())
+            && let Some(nearest) = times
+                .iter()
+                .enumerate()
+                .filter(|&(_, &held)| (held - at).abs() <= SAME_PLAY)
+                .min_by_key(|&(_, &held)| (held - at).abs())
+                .map(|(index, _)| index)
+        {
+            times.swap_remove(nearest);
+            continue;
         }
         out.push((at, play.clone()));
     }
@@ -161,6 +201,8 @@ pub fn merged(local: &[PlayHistory], remote: &[PlayHistory]) -> Vec<PlayHistory>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastframe_file::Writer;
+    use std::time::Duration;
 
     fn play(uri: &str, at: &str) -> PlayHistory {
         PlayHistory {
@@ -238,6 +280,27 @@ mod tests {
         assert_eq!(merged(&local, &distant).len(), 2, "five minutes apart");
     }
 
+    /// Each source reports every play it heard: a short song played twice
+    /// in a row is two plays, however close together they start. Only a
+    /// play that both sources report becomes one row.
+    #[test]
+    fn a_short_song_played_twice_by_one_source_is_two_rows() {
+        // A forty-second interlude played twice, on another device.
+        let remote = vec![
+            play("spotify:track:short", "2026-09-01T15:00:40Z"),
+            play("spotify:track:short", "2026-09-01T15:00:00Z"),
+        ];
+        assert_eq!(merged(&[], &remote).len(), 2, "two plays on another device");
+        // The same two plays, made here.
+        assert_eq!(merged(&remote, &[]).len(), 2, "two plays on this computer");
+        // Made here and reported by Spotify as well: two plays, each once.
+        let reported = vec![
+            play("spotify:track:short", "2026-09-01T15:00:45Z"),
+            play("spotify:track:short", "2026-09-01T15:00:05Z"),
+        ];
+        assert_eq!(merged(&remote, &reported).len(), 2, "each play once");
+    }
+
     /// A play without a timestamp sorts to the end.
     #[test]
     fn a_play_with_no_time_sinks_to_the_end() {
@@ -269,5 +332,97 @@ mod tests {
             format!("spotify:track:{}", KEPT + 9),
             "the newest is first"
         );
+    }
+
+    /// A save replaces the whole file and leaves no temporary behind, and a
+    /// second save over it reads back the newer history.
+    #[test]
+    fn a_saved_history_reads_back_whole() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-history-{:016x}", rand::random::<u64>()));
+        let path = dir.join("history.json");
+        let at: jiff::Timestamp = "2026-09-01T09:00:00Z".parse().unwrap();
+        let files = Writer::new();
+        let mut history = History::default();
+        for uri in ["spotify:track:a", "spotify:track:b"] {
+            history.record(
+                Track {
+                    uri: uri.into(),
+                    ..Track::default()
+                },
+                at,
+            );
+            history.save(&files, &path);
+        }
+        assert!(files.flush(Duration::from_secs(10)));
+        let read = History::load(&path);
+        let uris: Vec<_> = read
+            .plays()
+            .iter()
+            .map(|play| play.track.uri.as_str())
+            .collect();
+        assert_eq!(uris, ["spotify:track:b", "spotify:track:a"]);
+        assert!(crate::util::temporary_files(path.parent().unwrap()).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A save that cannot write keeps the plays to write, so the next save
+    /// still has them rather than losing the song just recorded.
+    #[test]
+    fn a_failed_save_keeps_the_history_to_write() {
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-history-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file where the history's folder should be: nothing can be
+        // written under it.
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, "").unwrap();
+        let mut history = History::default();
+        history.record(
+            Track {
+                uri: "spotify:track:a".into(),
+                ..Track::default()
+            },
+            "2026-09-01T09:00:00Z".parse().unwrap(),
+        );
+        let files = Writer::new();
+        history.save(&files, &blocked.join("history.json"));
+        assert!(files.flush(Duration::from_secs(10)));
+        assert!(history.needs_save(), "the failed write is still to be done");
+
+        let path = dir.join("history.json");
+        history.save(&files, &path);
+        assert!(files.flush(Duration::from_secs(10)));
+        assert!(!history.needs_save());
+        assert_eq!(History::load(&path).plays().len(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The history is readable by its owner only, even when it replaces a
+    /// file others could read.
+    #[cfg(unix)]
+    #[test]
+    fn the_history_is_kept_from_other_accounts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("spotifast-history-{:016x}", rand::random::<u64>()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.json");
+        std::fs::write(&path, "[]").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut history = History::default();
+        history.record(
+            Track {
+                uri: "spotify:track:a".into(),
+                ..Track::default()
+            },
+            "2026-09-01T09:00:00Z".parse().unwrap(),
+        );
+        let files = Writer::new();
+        history.save(&files, &path);
+        assert!(files.flush(Duration::from_secs(10)));
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

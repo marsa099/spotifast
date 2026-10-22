@@ -18,7 +18,14 @@ pub struct TableRowsCache {
     pub generation: u64,
     pub items_revision: u64,
     pub user_names_revision: u64,
-    pub items: Arc<[TableItem]>,
+    pub items: Arc<Vec<TableItem>>,
+    /// Playlist rows retain their server slots, including gaps for unavailable items.
+    pub playlist_positions: Option<Arc<Vec<usize>>>,
+    pub playlist_raw_count: usize,
+    pub playlist_duration_ms: u64,
+    pub playlist_owner: Option<(Option<String>, String)>,
+    /// Set only when the next revision extends this cached playlist prefix.
+    pub playlist_append_revision: Option<u64>,
 }
 
 impl TableRowsCache {
@@ -26,6 +33,13 @@ impl TableRowsCache {
     /// the top-level URI and title.
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
+            + self.items.capacity() * std::mem::size_of::<TableItem>()
+            + self.playlist_positions.as_ref().map_or(0, |positions| {
+                positions.capacity() * std::mem::size_of::<usize>()
+            })
+            + self.playlist_owner.as_ref().map_or(0, |(id, name)| {
+                id.as_ref().map_or(0, String::len) + name.len()
+            })
             + self
                 .items
                 .iter()
@@ -96,6 +110,8 @@ fn episode_retained_bytes(episode: &Episode) -> usize {
 pub enum Page {
     Home,
     TopSongs,
+    /// The songs of the latest releases from followed artists.
+    NewReleases,
     Search,
     LikedSongs,
     Albums,
@@ -106,6 +122,9 @@ pub enum Page {
     Album(String),
     Artist(String),
     Show(String),
+    /// Spotify's radio seeded by a song, playlist, album, or artist, by the
+    /// seed's URI.
+    Radio(String),
     Queue,
     Settings,
 }
@@ -115,6 +134,7 @@ impl Page {
         match self {
             Page::Home => "home".into(),
             Page::TopSongs => "top-songs".into(),
+            Page::NewReleases => "new-releases".into(),
             Page::Search => "search".into(),
             Page::LikedSongs => "liked".into(),
             Page::Albums => "albums".into(),
@@ -125,6 +145,7 @@ impl Page {
             Page::Album(id) => format!("album:{id}"),
             Page::Artist(id) => format!("artist:{id}"),
             Page::Show(id) => format!("show:{id}"),
+            Page::Radio(seed) => format!("radio:{seed}"),
             Page::Queue => "queue".into(),
             Page::Settings => "settings".into(),
         }
@@ -134,6 +155,7 @@ impl Page {
         Some(match text {
             "home" => Page::Home,
             "top-songs" => Page::TopSongs,
+            "new-releases" => Page::NewReleases,
             "search" => Page::Search,
             "liked" => Page::LikedSongs,
             "albums" => Page::Albums,
@@ -149,6 +171,7 @@ impl Page {
                     "album" => Page::Album(id.into()),
                     "artist" => Page::Artist(id.into()),
                     "show" => Page::Show(id.into()),
+                    "radio" if crate::util::station_uri(id).is_some() => Page::Radio(id.into()),
                     _ => return None,
                 }
             }
@@ -250,6 +273,8 @@ pub struct PagedList<T> {
     pub items: Vec<T>,
     /// Spotify offset of the first item. Nonzero for a directly opened page.
     pub base_offset: u32,
+    pub windows: std::collections::BTreeMap<u32, Vec<T>>,
+    pub window_request: Option<u32>,
     pub total: Option<u32>,
     pub next_offset: Option<u32>,
     pub loading: bool,
@@ -263,6 +288,8 @@ impl<T> Default for PagedList<T> {
         Self {
             items: Vec::new(),
             base_offset: 0,
+            windows: Default::default(),
+            window_request: None,
             total: None,
             next_offset: Some(0),
             loading: false,
@@ -274,6 +301,97 @@ impl<T> Default for PagedList<T> {
 }
 
 impl<T> PagedList<T> {
+    /// Select a cached window, or reserve a direct request for the visible row.
+    /// Adjacent windows merge on arrival, so a viewport can cross page edges.
+    pub fn window_at(&mut self, position: u32, size: u32) -> Option<u32> {
+        if self.loading
+            || self.error.is_some()
+            || size == 0
+            || self.total.is_none_or(|total| position >= total)
+            || (self.base_offset..self.base_offset.saturating_add(self.items.len() as u32))
+                .contains(&position)
+        {
+            return None;
+        }
+        let cached = self
+            .windows
+            .range(..=position)
+            .next_back()
+            .filter(|(start, items)| position < start.saturating_add(items.len() as u32))
+            .map(|(start, _)| *start);
+        if let Some(start) = cached {
+            self.save_window();
+            self.items = self.windows.remove(&start).unwrap();
+            self.base_offset = start;
+            self.loaded_once = true;
+            self.join_windows();
+            self.revision = self.revision.wrapping_add(1);
+            return None;
+        }
+        let offset = position / size * size;
+        let end = self.base_offset.saturating_add(self.items.len() as u32);
+        // Adjacent reads extend the visible window; only a distant jump swaps it.
+        if offset > end || offset.saturating_add(size) < self.base_offset {
+            self.save_window();
+            self.base_offset = offset;
+            self.loaded_once = false;
+            self.next_offset = Some(offset);
+            self.revision = self.revision.wrapping_add(1);
+        }
+        self.window_request = Some(offset);
+        self.loading = true;
+        Some(offset)
+    }
+
+    fn save_window(&mut self) {
+        if !self.items.is_empty() {
+            self.windows
+                .insert(self.base_offset, std::mem::take(&mut self.items));
+        }
+    }
+
+    /// Edits or refreshes invalidate other windows' server positions.
+    pub fn clear_windows(&mut self) {
+        self.windows.clear();
+        self.window_request = None;
+    }
+
+    fn join_windows(&mut self) {
+        // The incoming page wins overlaps; retain cached rows on either side.
+        loop {
+            let end = self.base_offset.saturating_add(self.items.len() as u32);
+            let adjacent = self
+                .windows
+                .iter()
+                .find(|(start, items)| {
+                    **start <= end && start.saturating_add(items.len() as u32) >= self.base_offset
+                })
+                .map(|(start, _)| *start);
+            let Some(start) = adjacent else {
+                break;
+            };
+            let mut other = self.windows.remove(&start).unwrap();
+            let other_end = start.saturating_add(other.len() as u32);
+            if start < self.base_offset {
+                let tail = if other_end > end {
+                    other.split_off((end - start) as usize)
+                } else {
+                    Vec::new()
+                };
+                other.truncate((self.base_offset - start) as usize);
+                other.append(&mut self.items);
+                other.extend(tail);
+                self.items = other;
+                self.base_offset = start;
+            } else if other_end > end {
+                self.items
+                    .extend(other.into_iter().skip((end - start) as usize));
+            }
+        }
+        self.next_offset = Some(self.base_offset.saturating_add(self.items.len() as u32))
+            .filter(|end| self.total.is_some_and(|total| *end < total));
+    }
+
     pub fn reset(&mut self) {
         *self = Self {
             revision: self.revision.wrapping_add(1),
@@ -282,7 +400,7 @@ impl<T> PagedList<T> {
     }
 
     pub fn can_load_more(&self) -> bool {
-        !self.loading && self.next_offset.is_some()
+        !self.loading && (self.window_request.is_some() || self.next_offset.is_some())
     }
 
     pub fn is_complete(&self) -> bool {
@@ -290,21 +408,37 @@ impl<T> PagedList<T> {
     }
 
     pub fn absorb(&mut self, offset: u32, page: Page_<T>) {
-        if offset == 0 {
-            self.items.clear();
-            self.base_offset = 0;
-        } else if !self.loaded_once {
-            self.items.clear();
-            self.base_offset = offset;
-        }
-        let relative = offset.saturating_sub(self.base_offset) as usize;
-        if relative < self.items.len() {
-            self.items.truncate(relative);
-        }
+        let window = self.window_request.take().is_some();
         let next_offset = page.next_offset();
-        self.items.extend(page.items);
+        if window {
+            if self.total.is_some_and(|total| total != page.total) {
+                self.clear_windows();
+                self.items.clear();
+            } else {
+                self.save_window();
+            }
+            self.base_offset = offset;
+            self.items = page.items;
+        } else {
+            if offset == 0 {
+                self.clear_windows();
+                self.items.clear();
+                self.base_offset = 0;
+            } else if !self.loaded_once {
+                self.items.clear();
+                self.base_offset = offset;
+            }
+            let relative = offset.saturating_sub(self.base_offset) as usize;
+            if relative < self.items.len() {
+                self.items.truncate(relative);
+            }
+            self.items.extend(page.items);
+        }
         self.total = Some(page.total);
         self.next_offset = next_offset;
+        if window || !self.windows.is_empty() {
+            self.join_windows();
+        }
         self.loading = false;
         self.error = None;
         self.loaded_once = true;
@@ -328,7 +462,25 @@ impl<T> PagedList<T> {
         }
     }
 
+    /// Adopt a disk prefix without replacing a distant viewport or its request.
+    pub fn adopt_cached_prefix(&mut self, items: Vec<T>, total: u32, next_offset: Option<u32>) {
+        if self.base_offset == 0 && self.window_request.is_none() {
+            self.restore_cached(items, total, next_offset);
+        } else {
+            if self.base_offset == 0 {
+                self.items = items;
+                self.next_offset = next_offset;
+                self.loaded_once = true;
+            } else {
+                self.windows.insert(0, items);
+            }
+            self.total = Some(total);
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
     pub fn restore_cached(&mut self, items: Vec<T>, total: u32, next_offset: Option<u32>) {
+        self.clear_windows();
         self.items = items;
         self.base_offset = 0;
         self.total = Some(total);
@@ -414,12 +566,45 @@ impl<T> CursorList<T> {
 pub struct Library {
     pub playlists: Loadable<Vec<Playlist>>,
     pub playlists_next: Option<u32>,
+    /// Which load of the playlists the pages on their way belong to. Every
+    /// load from the top takes a new one, so a page asked for by an earlier
+    /// load is not taken into the new list, even at the same offset.
+    pub playlists_generation: u64,
+    /// The later playlist page on its way, so a second answer for a page
+    /// already taken adds nothing.
+    pub playlists_asked: Option<u32>,
+    /// When the load on its way began, or `None` when none is.
+    pub playlists_loading_since: Option<Instant>,
+    /// The pages of a reload while the previous list stays shown. The new
+    /// list replaces it whole once its last page arrives, so the sidebar
+    /// never shrinks to the first page and grows back.
+    pub playlists_incoming: Option<Vec<Playlist>>,
+    /// Playlists created or removed here, held over loads that may not
+    /// show the change yet.
+    pub playlists_edits: Vec<PlaylistEdit>,
+    /// When a load that Spotify turned away is asked for again.
+    pub playlists_retry_at: Option<Instant>,
+    /// The list shown is whole: every page of one load, or a restored
+    /// cache. Only a whole list is saved for the next start.
+    pub playlists_whole: bool,
     pub liked: PagedList<SavedTrack>,
     pub albums: PagedList<SavedAlbum>,
     pub artists: CursorList<Artist>,
     pub shows: PagedList<SavedShow>,
     pub episodes: PagedList<SavedEpisode>,
     pub filter: String,
+}
+
+/// A playlist created or removed here, shown that way whatever a load that
+/// began before Spotify confirmed it says.
+#[derive(Clone, Debug)]
+pub struct PlaylistEdit {
+    pub uri: String,
+    /// The playlist to list, or `None` when it was removed.
+    pub added: Option<Playlist>,
+    /// The first load that can tell of the change: one asked for after
+    /// Spotify confirmed it. `None` while it is unconfirmed.
+    pub settled_by: Option<u64>,
 }
 
 #[derive(Default)]
@@ -433,15 +618,76 @@ pub struct HomeData {
     pub top_songs_loading: bool,
     pub top_songs_complete: bool,
     pub recommendations: Loadable<Vec<Track>>,
-    pub discover: HashMap<String, Loadable<Vec<Playlist>>>,
-    pub discover_pending: HashMap<String, Loadable<Vec<Playlist>>>,
+    pub made_for_you: Loadable<Vec<Playlist>>,
+    /// Whether the displayed cards came from the personalized session route.
+    pub made_for_you_personalized: bool,
+    /// Independent request serial: playback readiness can supersede a fallback.
+    pub made_for_you_generation: u64,
+    /// One outstanding shelf answer counts toward the Home refresh.
+    pub made_for_you_loading: bool,
+    /// Whether playback was ready when the current shelf request began.
+    pub made_for_you_session_requested: bool,
+    pub top_mixes: Loadable<Vec<Playlist>>,
+    /// The latest releases from followed artists, newest first.
+    pub new_releases: Loadable<Vec<Album>>,
+    pub new_releases_generation: u64,
+    /// One outstanding New releases answer counts toward the Home refresh.
+    pub new_releases_loading: bool,
+    /// The songs of `new_releases`, for the New releases page, and the
+    /// releases they were read for.
+    pub new_release_tracks: Loadable<Vec<Track>>,
+    pub new_release_tracks_for: Vec<String>,
+    pub new_release_tracks_generation: u64,
+    /// Saved podcasts with their newest episodes, in library order, for the
+    /// podcast shelf. A refresh replaces them only once it answers.
+    pub podcasts: Vec<(Show, Vec<Episode>)>,
+    /// The Home generation whose podcast episodes were last asked for.
+    pub podcasts_generation: u64,
     pub generation: u64,
     pub top_songs_generation: u64,
     pub requested: bool,
     pub loaded_at: Option<Instant>,
+    /// Answers the current refresh still waits for.
+    pub awaiting: usize,
+    /// An answer of the current refresh failed, so the shelves may show
+    /// older, cached rows: the network coming back reads them again.
+    pub refresh_failed: bool,
+    /// Spotify answered for the podcasts, or there are none to ask about,
+    /// so a late cache does not bring back what it showed before.
+    pub podcasts_answered: bool,
 }
 
-pub const DISCOVER_TERMS: &[&str] = &["Discover Weekly", "Release Radar", "Daily Mix", "daylist"];
+/// What the top bar's spinner says the app is waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundActivity {
+    /// The playlist list or Home is being read again behind what it shows.
+    Library,
+    /// A check for a newer release.
+    Updates,
+    /// Any other request to Spotify.
+    Spotify,
+}
+
+/// What Home last showed for one account, shown at the next start while
+/// Home is read again.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct HomeSnapshot {
+    /// `None` for a shelf Spotify had not answered for, so it loads again
+    /// at the next start instead of showing as empty.
+    pub recently_played: Option<Vec<PlayHistory>>,
+    pub top_artists: Option<Vec<Artist>>,
+    pub top_tracks: Option<Vec<Track>>,
+    /// The ordered shelf and its origin, retained across restarts.
+    pub made_for_you: Option<Vec<Playlist>>,
+    pub made_for_you_personalized: bool,
+    pub top_mixes: Option<Vec<Playlist>>,
+    pub new_releases: Option<Vec<Album>>,
+    /// Legacy search shelves, read for compatibility with older cache files.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub discover: std::collections::BTreeMap<String, Vec<Playlist>>,
+    pub podcasts: Vec<(Show, Vec<Episode>)>,
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SearchFilter {
@@ -466,15 +712,16 @@ impl SearchFilter {
         Self::Episodes,
     ];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> std::borrow::Cow<'static, str> {
+        use crate::i18n::{gettext, pgettext};
         match self {
-            Self::All => "All",
-            Self::Songs => "Songs",
-            Self::Artists => "Artists",
-            Self::Albums => "Albums",
-            Self::Playlists => "Playlists",
-            Self::Podcasts => "Podcasts",
-            Self::Episodes => "Episodes",
+            Self::All => pgettext(locale, "filter", "All"),
+            Self::Songs => gettext(locale, "Songs"),
+            Self::Artists => gettext(locale, "Artists"),
+            Self::Albums => gettext(locale, "Albums"),
+            Self::Playlists => gettext(locale, "Playlists"),
+            Self::Podcasts => gettext(locale, "Podcasts"),
+            Self::Episodes => gettext(locale, "Episodes"),
         }
     }
 }
@@ -485,8 +732,23 @@ pub struct SearchState {
     pub committed: String,
     pub serial: u64,
     pub results: Loadable<SearchResults>,
+    pub results_serial: u64,
+    pub playlists: Option<(u64, crate::api::models::Page<Playlist>)>,
+    pub catalogue_pending: bool,
+    pub playlists_pending: bool,
+    pub error: Option<String>,
     pub filter: SearchFilter,
     pub typed_at: Option<Instant>,
+    /// Counts runs of typing in the search field. A run ends when the field
+    /// is emptied, its selected text is typed over, or the query is
+    /// submitted.
+    pub edit_run: u64,
+    /// The run the committed query came from, and whether it is still being
+    /// typed. None for a recent search or a link.
+    pub committed_run: Option<(u64, bool)>,
+    /// The Recent searches entry a run recorded. A pause while typing commits
+    /// a prefix; the next query of the same run replaces it.
+    pub typed_entry: Option<(u64, String)>,
     pub focus_requested: bool,
 }
 
@@ -506,13 +768,19 @@ pub struct PlaylistPage {
     pub cache_checked: bool,
     /// The Spotify offset through which this snapshot is saved on disk.
     pub cache_saved_through: Option<u32>,
+    pub cache_saved_total: Option<u32>,
+    /// Number of rows in that checkpoint. Spotify offsets may skip positions.
+    pub cache_saved_rows: usize,
+    /// Identifies an in-flight checkpoint across generation resets until it completes.
+    /// One checkpoint at a time lets failed appends be retried safely.
+    pub cache_write_pending: Option<PlaylistCachePending>,
+    /// False when existing rows may have changed since the saved checkpoint.
+    pub cache_append_valid: bool,
     /// End of the prefix restored for this generation. An initial response
     /// below it is stale and must not replace the longer cached prefix.
     pub cache_restored_through: Option<u32>,
     /// Items read from disk, waiting for the live snapshot to confirm.
     pub pending_cache: Option<PlaylistCache>,
-    /// One-based position entered in the direct page control.
-    pub jump_position: u32,
     /// Songs added here that may sit beyond the loaded prefix. They are known
     /// members immediately, even before Spotify's next read catches up.
     pub local_additions: std::collections::BTreeSet<String>,
@@ -522,6 +790,9 @@ pub struct PlaylistPage {
     /// Writes still awaiting a result. Keep their optimistic rows in memory
     /// even when navigation moves beyond the usual page-cache limit.
     pub pending_writes: usize,
+    /// A manual refresh waiting for pending writes and their snapshot to be
+    /// confirmed before requesting replacement rows.
+    pub refresh_after_write: bool,
     /// Number of immediate metadata reads made while Spotify still reported
     /// the pre-write snapshot.
     pub snapshot_rechecks: u8,
@@ -534,12 +805,24 @@ pub struct PlaylistCache {
     pub items: Vec<PlaylistItem>,
     pub total: u32,
     pub next_offset: Option<u32>,
+    /// The on-disk prefix can accept new blocks without a full rewrite.
+    pub appendable: bool,
+}
+
+pub struct PlaylistCachePending {
+    pub generation: u64,
+    pub snapshot: String,
+    pub through: u32,
+    pub rows: usize,
+    pub total: u32,
+    pub replacing: bool,
 }
 
 #[derive(Default)]
 pub struct AlbumPage {
     pub generation: u64,
     pub album: Loadable<Album>,
+    pub prerelease: Option<crate::prerelease::Prerelease>,
     pub tracks: PagedList<Track>,
 }
 
@@ -556,12 +839,13 @@ impl DiscographyFilter {
     pub const ALL: [DiscographyFilter; 4] =
         [Self::All, Self::Albums, Self::Singles, Self::AppearsOn];
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, locale: crate::i18n::Locale) -> std::borrow::Cow<'static, str> {
+        use crate::i18n::{gettext, pgettext};
         match self {
-            Self::All => "All",
-            Self::Albums => "Albums",
-            Self::Singles => "Singles & EPs",
-            Self::AppearsOn => "Appears On",
+            Self::All => pgettext(locale, "filter", "All"),
+            Self::Albums => gettext(locale, "Albums"),
+            Self::Singles => gettext(locale, "Singles & EPs"),
+            Self::AppearsOn => gettext(locale, "Appears On"),
         }
     }
 
@@ -583,6 +867,21 @@ pub struct ArtistPage {
     pub related: Loadable<Vec<Artist>>,
     pub filter: DiscographyFilter,
     pub show_all_top: bool,
+}
+
+/// A radio page: the songs Spotify mixed for its seed, which are the songs
+/// its Play button plays.
+#[derive(Default)]
+pub struct RadioPage {
+    pub songs: Loadable<Vec<Track>>,
+    /// The name and artwork known when the page opened, kept should the
+    /// seed's own details be let go while the page stays.
+    pub name: Option<String>,
+    pub images: Vec<crate::api::models::Image>,
+    /// Identifies the request whose answer may fill `songs`.
+    pub generation: u64,
+    /// A new mix is on its way; the songs shown stay until it arrives.
+    pub refreshing: bool,
 }
 
 #[derive(Default)]
@@ -626,27 +925,35 @@ pub enum RowContext {
     View {
         uris: Arc<[String]>,
         context_uri: String,
+        /// The playlist id when the user can edit it, enabling removal.
+        /// Screen positions no longer match server positions, so moves
+        /// stay disabled; removal is URI-based and safe.
+        editable_playlist: Option<(String, Option<String>)>,
     },
 }
 
 /// Track data held during a drag.
 #[derive(Clone, Debug)]
 pub struct DragTrack {
-    pub uri: String,
     pub title: String,
     /// Cover art for the drag preview.
     pub image: Option<String>,
     /// Full row data, so dropping can update an open playlist immediately.
-    pub item: PlayableItem,
+    /// A picked table row carries the whole selection in table order.
+    pub items: Vec<PlayableItem>,
     /// Source playlist ID and row index for moves within an editable playlist.
     pub from: Option<(String, u32)>,
+    /// The editable playlist the rows were dragged from, however many there
+    /// are. Several rows have no `from`, and dropping them back into their
+    /// own playlist must not add copies of them (#669).
+    pub source_playlist: Option<String>,
 }
 
 /// Where the playing songs come from, as the queue's header names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlayingFrom {
     pub name: String,
-    /// The page that opens on click. A song radio has none.
+    /// The page that opens on click, when there is one.
     pub page: Option<Page>,
 }
 
@@ -660,16 +967,27 @@ pub struct DragEntry {
 
 #[derive(Clone, Debug)]
 pub enum Dialog {
+    /// A page's header cover, enlarged. Clicking anywhere or Esc closes it.
+    CoverArt {
+        /// The largest artwork Spotify has.
+        url: String,
+        /// The header's own artwork, already loaded, shown until `url` is.
+        shown: Option<String>,
+        title: String,
+    },
     CreatePlaylist {
         name: String,
         public: bool,
         add_uris: Vec<String>,
     },
     EditPlaylist {
+        cover: crate::playlist_cover::Draft,
         id: String,
         name: String,
         description: String,
-        public: bool,
+        /// `None` while nothing has said whether the playlist is public;
+        /// left untouched on save unless the switch is used.
+        public: Option<bool>,
     },
     ConfirmDeletePlaylist {
         id: String,
@@ -734,8 +1052,15 @@ pub enum Action {
         view: String,
         row: Option<usize>,
     },
-    ToggleLibraryFolder(String),
     Open(Page),
+    /// Opens the radio of a song shown in a list, after caching the row's
+    /// song so the page has its name and cover (#644).
+    OpenSongRadio {
+        uri: String,
+        track: Box<Track>,
+    },
+    /// Extracts a page's tint while its library row is hovered.
+    PrepareTint(String),
     OpenUri(String),
     /// A Spotify link from outside the app: its page opens and the window
     /// comes forward, once the account is signed in.
@@ -747,6 +1072,26 @@ pub enum Action {
         offset_uri: Option<String>,
         offset_index: Option<u32>,
     },
+    /// Search one kind of thing and play the best match, as
+    /// `spotifast play-search` asks. Queued like the other play actions so
+    /// it takes precedence in the order it was asked for.
+    PlaySearch {
+        kind: String,
+        query: String,
+    },
+    /// The match a play-search found, played only if nothing has taken
+    /// precedence since: a newer play queued in the same frame as the
+    /// answer must still win.
+    PlaySearchMatch {
+        uri: String,
+        serial: u64,
+    },
+    /// Play one episode, from `resume_ms` when the row, card or button
+    /// that asked showed it as started.
+    PlayEpisode {
+        uri: String,
+        resume_ms: Option<u32>,
+    },
     PlayUris {
         uris: Vec<String>,
         index: u32,
@@ -756,8 +1101,6 @@ pub enum Action {
         uri: String,
         index: u32,
     },
-    /// Spotify's station seeded by this song.
-    PlayTrackRadio(String),
     ShufflePlay(String),
     TogglePlay,
     Next,
@@ -782,6 +1125,31 @@ pub enum Action {
     QueueMany {
         songs: Vec<(String, String)>,
     },
+    /// Put songs first in the manual queue, in order, only on this computer.
+    PlayNext {
+        items: Vec<PlayableItem>,
+    },
+    /// Move a row within the manually queued "Playing next" section, from a
+    /// drag dropped back on the queue. Only applied while the local player
+    /// is the active target; see [`crate::app::App::queue_locally_reorderable`].
+    MoveInQueue {
+        from: usize,
+        to: usize,
+    },
+    /// Insert dragged songs into "Playing next" at a position, instead of
+    /// always appending like `QueueMany`. Falls back to appending when the
+    /// local player is not the active target.
+    InsertInQueue {
+        items: Vec<PlayableItem>,
+        position: usize,
+    },
+    /// Take rows out of the manually queued "Playing next" section, each
+    /// named by its index in the queue and the song it holds there. Only
+    /// applied while the local player is the active target; see
+    /// [`crate::app::App::queue_locally_reorderable`].
+    RemoveFromQueue {
+        rows: Vec<(usize, String)>,
+    },
     /// Set saved state for several songs explicitly.
     SetSavedMany {
         uris: Vec<String>,
@@ -792,11 +1160,11 @@ pub enum Action {
         playlist_name: String,
         items: Vec<PlayableItem>,
     },
-    /// Copy a dragged song into an open playlist at an absolute position.
+    /// Copy dragged songs into an open playlist at an absolute position.
     InsertInPlaylist {
         playlist_id: String,
         position: u32,
-        item: Box<PlayableItem>,
+        items: Vec<PlayableItem>,
     },
     ConfirmAddToPlaylist {
         playlist_id: String,
@@ -807,6 +1175,10 @@ pub enum Action {
     RemoveFromPlaylist {
         playlist_id: String,
         uris: Vec<String>,
+        /// The picked rows' server positions, one for each of `uris`, when
+        /// the view knows them; empty otherwise. With them, a song the list
+        /// holds more than once loses only the picked copies.
+        positions: Vec<u32>,
     },
     MoveInPlaylist {
         playlist_id: String,
@@ -820,34 +1192,67 @@ pub enum Action {
         public: bool,
         add_uris: Vec<String>,
     },
+    ChoosePlaylistCover(String),
+    UploadPlaylistCover(String),
     UpdatePlaylist {
         id: String,
         name: String,
         description: String,
-        public: bool,
+        public: Option<bool>,
     },
     DeletePlaylist(String),
     Transfer(String),
     /// Send the account to a receiver found on the local network.
     ActivateReceiver(Box<crate::zeroconf::Receiver>),
     RefreshDevices,
+    /// List this computer's audio outputs for the device picker.
+    ListOutputDevices,
+    /// Start Spotifast when the person logs in, this way, or not at all.
+    SetStartWithComputer(Option<fastframe_autostart::Start>),
+    /// Play through this output, by name; `None` is the system default.
+    SetAudioDevice(Option<String>),
     /// Empty Next up of its queued songs, keeping the context's own.
     ClearQueue,
     /// Save the current and upcoming queue as a playlist.
     SaveQueueAsPlaylist,
+    /// Save a radio page's songs to a new playlist, by the seed's URI.
+    SaveRadio(String),
+    /// Hide a song in one of Spotify's playlists, or show it again (#779).
+    SetHiddenInPlaylist {
+        playlist_uri: String,
+        track_uri: String,
+        hidden: bool,
+    },
     RefreshQueue,
     CopyLink(String),
+    /// Copy picked songs' links, one per line, and remember the songs so a
+    /// paste of the same links can show their rows at once.
+    CopySongs(Vec<PlayableItem>),
+    /// Append the Spotify song links in pasted text to an editable playlist.
+    PasteSongs {
+        playlist_id: String,
+        text: String,
+    },
     /// Open a web page in the browser.
     OpenUrl(String),
+    SetPrereleaseSaved {
+        uri: String,
+        saved: bool,
+    },
     OpenInSpotify(String),
     Search(String),
+    /// The search field was emptied or its selection typed over, so the
+    /// next query starts a new run of typing.
+    EndSearchRun,
+    ForgetSearch(String),
     SetSearchFilter(SearchFilter),
     FocusSearch,
     LoadMore(Page),
-    JumpToPlaylistPosition {
-        id: String,
+    LoadWindow {
+        page: Page,
         position: u32,
     },
+    RetryWindow(Page),
     LoadMoreRecents,
     ReloadRecents,
     SetQueueTab(QueueTab),
@@ -867,20 +1272,46 @@ pub enum Action {
     ToggleSidebar,
     ToggleQueuePanel,
     ToggleLyricsPanel,
+    /// Show or hide what friends are listening to, in the right panel.
+    ToggleFriendsPanel,
+    SetLyricsFullscreen(bool),
+    LyricsLineShown(Option<usize>),
+    FollowLyrics,
+    PauseLyricsFollow,
+    RetryLyrics,
     ToggleDevicesPopup,
     /// Ask GitHub for the latest release and report the result to the user.
     CheckForUpdates,
+    ShowUpdate,
+    DownloadUpdate,
+    InstallUpdate,
     SettingsChanged,
+    SetTheme(crate::settings::ThemeChoice),
+    /// Draw the interface in this language from the next frame on.
+    SetLanguage(crate::settings::LanguageChoice),
+    OpenThemesFolder,
+    SetCustomTheme(String),
+    /// Follow system shows this palette file (or Spotifast's own with
+    /// `None`) while the system is in this appearance.
+    SetPairTheme(fastframe_theme::Base, Option<String>),
+    ReloadThemes,
+    SetLibraryByYou(bool),
     SetLibrarySort {
         shelf: crate::settings::LibraryShelf,
         sort: crate::settings::LibrarySort,
     },
+    SetLibraryGrid(bool),
+    ToggleLibraryFolder(String),
     ArrangeLibrary {
         pinned: Vec<String>,
         /// A drag outside the pin block selects this local playlist order.
         playlist_order: Option<Vec<String>>,
     },
     RestartEngine,
+    /// Rebuild the HTTP client with the proxy in settings. Local playback
+    /// restarts only when its HTTP proxy changed.
+    ApplyProxy,
+    ProxyEdited,
     EnablePlayback,
     ShowWindow,
     HideWindow,
@@ -897,9 +1328,20 @@ pub enum Action {
     SetSkinScale(u8),
     ToggleWinampOnTop,
     SetWinampTaskbar(bool),
+    /// Windows: draw Spotifast's own title bar instead of the standard one.
+    SetCustomTitlebar(bool),
     OpenSkinsFolder,
+    /// Pick the folder a playlist's local files play from.
+    ChooseLocalFilesFolder,
+    /// Stop playing local files.
+    ForgetLocalFilesFolder,
+    OpenLocalFilesFolder,
+    /// Pick a different skin each time the mini player opens.
+    SetRandomSkin(bool),
     /// Cycle bars, scope, and off.
     CycleVisualiser,
+    /// A click on the player bar's empty space: spectrum, waveform, off.
+    CyclePlayerBarVis,
     /// Set the visualizer mode directly.
     SetVisualiser(crate::settings::VisMode),
     /// Open or close the playlist window under the mini player.
@@ -914,6 +1356,13 @@ pub enum Action {
     SetEqPreamp(f32),
     /// One of Winamp's presets, by its place in the list.
     ApplyEqPreset(usize),
+    /// A preset saved here, by name: its preamp and bands.
+    ApplyUserEqPreset(String),
+    /// Save the preamp and bands as a preset of this name, replacing one
+    /// already saved under it.
+    SaveEqPreset(String),
+    /// Forget a saved preset, by name.
+    DeleteEqPreset(String),
     /// The balance, -1 all left to 1 all right.
     SetBalance(f32),
     ToggleMono,
@@ -938,4 +1387,130 @@ pub enum Action {
     /// in the list.
     DownloadMilkdropPack(usize),
     Quit,
+}
+
+#[cfg(test)]
+mod finite_scroll_tests {
+    use super::*;
+
+    fn page(offset: u32, count: u32, total: u32) -> Page_<u32> {
+        Page_ {
+            items: (offset..offset + count).collect(),
+            offset,
+            limit: count,
+            total,
+            next: (offset + count < total).then(|| "next".into()),
+        }
+    }
+
+    #[test]
+    fn a_failed_backward_window_can_retry_from_the_end() {
+        let mut list = PagedList::default();
+        list.absorb(950, page(950, 50, 1000));
+        assert_eq!(list.next_offset, None);
+        assert_eq!(list.window_at(920, 50), Some(900));
+        list.fail("Offline".into());
+        assert!(list.can_load_more());
+        assert_eq!(list.window_request, Some(900));
+    }
+
+    #[test]
+    fn late_cache_preserves_an_adjacent_request_and_its_cached_tail() {
+        let mut list = PagedList::default();
+        list.absorb(0, page(0, 50, 1000));
+        list.window_at(60, 50);
+        list.adopt_cached_prefix((0..500).collect(), 1000, Some(500));
+        assert!(list.loading);
+        list.absorb(50, page(50, 50, 1000));
+        assert_eq!(list.items.len(), 500);
+        assert_eq!(list.items[60], 60);
+    }
+
+    #[test]
+    fn catalog_pages_keep_rows_when_nulls_shorten_a_page() {
+        let mut list = PagedList::default();
+        list.absorb(0, page(0, 49, 100));
+        list.absorb(50, page(50, 50, 100));
+        assert_eq!(list.base_offset, 0);
+        assert_eq!(list.items.len(), 99);
+        assert_eq!(list.items[0], 0);
+    }
+
+    #[test]
+    fn distant_windows_keep_the_total_and_return_without_a_request() {
+        let mut list = PagedList::default();
+        list.absorb(0, page(0, 50, 1000));
+        assert_eq!(list.window_at(720, 50), Some(700));
+        assert_eq!(list.total, Some(1000));
+        list.absorb(700, page(700, 50, 1000));
+        assert_eq!(list.items[20], 720);
+        assert_eq!(list.window_at(10, 50), None);
+        assert_eq!(list.base_offset, 0);
+        assert_eq!(list.items[10], 10);
+        assert_eq!(list.window_at(720, 50), None);
+        assert_eq!(list.base_offset, 700);
+    }
+
+    #[test]
+    fn adjacent_windows_join_in_both_directions() {
+        let mut list = PagedList::default();
+        list.absorb(0, page(0, 50, 200));
+        assert_eq!(list.window_at(55, 50), Some(50));
+        list.absorb(50, page(50, 50, 200));
+        assert_eq!(list.base_offset, 0);
+        assert_eq!(list.items, (0..100).collect::<Vec<_>>());
+        assert_eq!(list.window_at(155, 50), Some(150));
+        list.absorb(150, page(150, 50, 200));
+        assert!(!list.is_complete());
+        assert_eq!(list.window_at(120, 50), Some(100));
+        list.absorb(100, page(100, 50, 200));
+        assert_eq!(list.items, (0..200).collect::<Vec<_>>());
+        assert!(list.is_complete());
+    }
+
+    #[test]
+    fn overlapping_initial_album_page_is_replaced_by_the_full_window() {
+        let mut list = PagedList::default();
+        list.absorb(0, page(0, 20, 200));
+        assert_eq!(list.window_at(25, 50), Some(0));
+        list.absorb(0, page(0, 50, 200));
+        assert!(
+            list.windows.is_empty(),
+            "superseded prefix must not stay cached"
+        );
+    }
+
+    #[test]
+    fn filling_a_partial_window_keeps_existing_rows_visible() {
+        let mut list = PagedList::default();
+        list.absorb(0, page(0, 49, 1000));
+        assert_eq!(list.window_at(49, 50), Some(0));
+        assert_eq!(list.items, (0..49).collect::<Vec<_>>());
+        list.absorb(0, page(0, 50, 1000));
+        assert_eq!(list.items, (0..50).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn overlapping_windows_keep_server_positions_after_an_edit() {
+        let mut list = PagedList::default();
+        list.absorb(701, page(701, 50, 1000));
+        assert_eq!(list.window_at(700, 50), Some(700));
+        assert_eq!(
+            list.items[0], 701,
+            "loaded songs stay visible during the request"
+        );
+        list.absorb(700, page(700, 50, 1000));
+        assert_eq!(list.base_offset, 700);
+        assert_eq!(list.items, (700..751).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn failed_window_does_not_retry_every_frame() {
+        let mut list = PagedList::default();
+        list.absorb(0, page(0, 50, 200));
+        assert_eq!(list.window_at(150, 50), Some(150));
+        assert_eq!(list.window_at(150, 50), None);
+        list.fail("offline".into());
+        assert_eq!(list.window_at(150, 50), None);
+    }
 }

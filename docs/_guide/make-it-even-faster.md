@@ -1,42 +1,64 @@
 ---
 title: Make It Even Faster
-description: "Use a personal Spotify app for a separate API quota."
+description: "Scrolling performance and reducing loading delays with your own Spotify connection."
 nav_order: 6
 ---
 
+## Scrolling and large libraries
+
+The sidebar is drawn alongside every page, so its sorting work can affect
+scrolling elsewhere in the window. Library ordering now looks up each row's
+position once per sort instead of repeatedly searching the full saved order.
+This reduces the work each frame needs for large libraries while preserving
+your chosen sort, pins, and folders.
+
+The main window draws as needed and uses the platform's frame pacing. The
+player bar and mini player visualizers draw at the **Frame rate** chosen in
+Settings > Appearance, 60 by default; a lower rate uses less power. The
+MilkDrop frame-rate setting applies to its separate visualizer window.
+
 ## API rate limits
 
-Fastpotify loads library and catalogue data through Spotify's Web API. By
-default, it shares a public app with several other open-source players. When
-that app reaches Spotify's request limit, requests are delayed and the top bar
-shows a spinner.
+Spotify limits how often apps can ask for information. Spotifast normally
+shares this allowance with other listeners and several other music players.
+When that shared connection is busy, your library and search results can take
+longer to load. The top bar shows a spinner while you wait; hover over it to
+see whether Spotifast is updating your library, checking for updates, or
+waiting for Spotify. Your playlists and Home show what they showed last time
+until the update arrives.
 
-On `main`, for the release after 0.7.1, Premium listeners using shared access
-see a one-time introduction to personal apps after their account is verified.
-**Set up personal app** opens Settings at the Client ID field, beside the
-setup guide. **Keep shared app**, Escape, or clicking outside the prompt
-dismisses it. That choice is remembered across restarts; setup remains
-available in Settings. The prompt waits while another dialog is open and does
-not appear in the Winamp window. This replaces the brief daily reminder shown
-after five seconds of busy requests in older releases.
+You can reduce those delays by creating a **personal Spotify app**. This is
+a connection registered to your account on Spotify's developer website.
+You do not need to write code or install another player.
 
-A personal app gives supported requests a separate Development Mode quota.
-Creating one is free and takes a few minutes.
-All Development Mode apps owned by your Spotify developer account share that
+Spotifast offers this setup once after you sign in with Premium. Choose
+**Set up personal app** to open Settings, or **Keep shared app** to continue
+as you are. You can set it up later in Settings.
+
+A personal app gives many of your searches and library requests a separate
+allowance. Creating one is free and takes a few minutes, and Spotify requires
+a Premium account. If you create several personal apps, they share your
 account's allowance, following Spotify's
 [July 2026 quota update](https://developer.spotify.com/blog/2026-07-23-web-api-quota-updates).
-This can reduce delays from the shared app; some requests still need shared
-access, and a personal app has its own limits.
+Some features still use the shared connection, and your personal connection
+has limits too.
 
 ## Shared coverage stays active
 
-Spotify keeps a personal app in Development Mode, and since February 2026 that
-mode omits Spotify-owned playlists and reads playlist items only for playlists
-you own or collaborate on. Artist top tracks, related artists,
-recommendations, and some catalog fields are unavailable too. Fastpotify uses
-the shared app for the complete playlist library, playlist-bearing search,
-external playlist metadata and items, and those unavailable operations. Your
-app handles supported requests. The shared app handles the rest.
+Your personal connection searches songs, artists, albums, podcasts, and
+episodes. The shared connection finds playlists and supplies features Spotify
+does not make available to personal apps, such as recommendations and related
+artists. Search results appear as each part is ready, so a delayed playlist
+search does not hold up the songs.
+
+Spotify allows personal apps ten search results at a time for each type,
+compared with twenty on the shared connection.
+
+Setting up playback on this computer also helps playlists load faster.
+Spotifast can load playlists that would otherwise use the shared allowance
+through its music connection instead, and while the shared connection is
+busy, your playlist list comes through it too.
+[How it connects](/how-it-connects/) explains which connection each feature uses.
 
 ## Make a Spotify app
 
@@ -56,13 +78,13 @@ app handles supported requests. The shared app handles the rest.
 
 ![Settings, with a personal Spotify app in use](/assets/images/make-it-even-faster.png)
 
-## Use it in Fastpotify
+## Use it in Spotifast
 
 1. Open **Settings**, find **Personal Spotify app**, and paste the
    Client ID.
 2. Click **Authorize**. Your browser opens Spotify's sign-in for your app.
-   Fastpotify verifies that it belongs to the same Spotify account, then shows
+   Spotifast verifies that it belongs to the same Spotify account, then shows
    **Personal app ready**.
 
-This does not affect local playback. Select **Remove** to delete the personal
-grant. The shared app stays signed in.
+Your playback setup stays the same. Select **Remove** to stop using your
+personal connection and return to shared access.

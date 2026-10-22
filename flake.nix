@@ -55,7 +55,9 @@
               apple-sdk
             ]
             ++ lib.optionals stdenv.hostPlatform.isLinux [
+              dbus
               alsa-lib
+              pipewire
               libpulseaudio
               libxkbcommon
               wayland
@@ -70,6 +72,7 @@
             pkgs.lib.makeLibraryPath (
               with pkgs;
               [
+                dbus
                 libxkbcommon
                 wayland
                 libGL
@@ -86,23 +89,17 @@
       packages = forAllSystems (
         pkgs:
         let
-          fastpotify =
+          spotifast =
             let
               toolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
               rustPlatform = pkgs.makeRustPlatform {
                 cargo = toolchain;
                 rustc = toolchain;
               };
-              cmakeWithLibdir = pkgs.writeShellScript "cmake-fastpotify" ''
-                if [[ "$1" == "--build" ]]; then
-                  exec ${pkgs.cmake}/bin/cmake "$@"
-                else
-                  exec ${pkgs.cmake}/bin/cmake "$@" -DCMAKE_INSTALL_LIBDIR=lib
-                fi
-              '';
               runtimeLibs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
                 with pkgs;
                 [
+                  dbus
                   libxkbcommon
                   wayland
                   libGL
@@ -113,19 +110,26 @@
                 ]
               );
             in
-            rustPlatform.buildRustPackage {
-              pname = "fastpotify";
+            rustPlatform.buildRustPackage rec {
+              pname = "spotifast";
               version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
               src = self;
 
               # The lock file contains git dependencies. fetchCargoVendor includes
               # them in the fixed-output dependency tree, unlike cargoLock alone.
               cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
-                pname = "fastpotify";
+                pname = "spotifast";
                 version = (pkgs.lib.importTOML ./Cargo.toml).package.version;
                 src = self;
-                hash = "sha256-LpLYZQxU8PinThuibkiUR5mxh/UYTD7rRtE6SnG37wc=";
+                hash = "sha256-kqq88OLSW2n9++YsIDMBM0AVVmK5YFWNqzQaNGJ8CyI=";
               };
+              # projectm-sys only searches lib, while CMake may otherwise install to lib64.
+              postPatch = ''
+                substituteInPlace "$cargoDepsCopy"/source-git-*/projectm-sys-*/build.rs \
+                  --replace-fail \
+                  '.define("BUILD_SHARED_LIBS", build_shared_libs)' \
+                  '.define("CMAKE_INSTALL_LIBDIR", "lib").define("BUILD_SHARED_LIBS", build_shared_libs)'
+              '';
 
               nativeBuildInputs =
                 with pkgs;
@@ -136,12 +140,20 @@
                   cmake
                   rustPlatform.bindgenHook
                 ]
-                ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ makeWrapper ];
+                ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ makeWrapper ]
+                ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
+                  rcodesign
+                  icnsify
+                ];
+              # The command-alias regression starts its own bus, isolated from
+              # the listener's desktop and running application.
+              nativeCheckInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.dbus ];
               buildInputs =
                 pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
                   with pkgs;
                   [
                     alsa-lib
+                    pipewire
                     libpulseaudio
                     # libprojectM links OpenGL directly and its GL loader needs
                     # X11 headers while it is built.
@@ -151,73 +163,64 @@
                 )
                 ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [ pkgs.apple-sdk ];
 
-              # projectm-sys expects CMake to install into lib/, while CMake
-              # defaults to lib64/ on NixOS.
-              env.CMAKE = "${cmakeWithLibdir}";
+              # Nix's Rust check hook deliberately points SSL_CERT_FILE at a
+              # missing path. The librespot proxy regression test constructs a
+              # TLS connector before asserting its CONNECT request, so give the
+              # test an explicit, sandboxed trust store.
+              preCheck = ''
+                export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              '';
 
               # The GUI dlopens its Wayland, X11 and GL libraries at run time.
-              postFixup = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-                wrapProgram $out/bin/fastpotify \
-                  --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath runtimeLibs}
-              '';
+              postFixup =
+                pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+                  wrapProgram $out/bin/spotifast \
+                    --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath runtimeLibs}
+                ''
+                + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+                  rcodesign sign "$out/Applications/Spotifast.app"
+                '';
 
-              postInstall = pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-                install -Dm644 packaging/applications/fastpotify.desktop \
-                  $out/share/applications/fastpotify.desktop
-                install -Dm644 packaging/icons/fastpotify.svg \
-                  $out/share/icons/hicolor/scalable/apps/fastpotify.svg
-              '';
+              postInstall =
+                pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+                  install -Dm644 packaging/applications/spotifast.desktop \
+                    $out/share/applications/spotifast.desktop
+                  install -Dm644 packaging/icons/spotifast.svg \
+                    $out/share/icons/hicolor/scalable/apps/spotifast.svg
+                  install -Dm644 contrib/omarchy/spotifast.json.tpl \
+                    $out/share/spotifast/omarchy/spotifast.json.tpl
+                  install -Dm755 contrib/omarchy/spotifast-theme \
+                    $out/share/spotifast/omarchy/spotifast-theme
+                ''
+                + pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+                  app="$out/Applications/Spotifast.app/Contents"
+                  mkdir -p "$app/MacOS" "$app/Resources"
+                  executable=Spotifast
+                  identifier=rocks.spotifast.Spotifast
+                  cp "$out/bin/spotifast" "$app/MacOS/$executable"
+                  icnsify packaging/macos/icon-1024.png -o "$app/Resources/spotifast.icns"
+                  substitute packaging/macos/Info.plist "$app/Info.plist" \
+                    --replace-fail __VERSION__ "${version}" \
+                    --replace-fail __BUILD__ "${pkgs.lib.head (pkgs.lib.splitString "-" version)}" \
+                    --replace-fail __EXECUTABLE__ "$executable" \
+                    --replace-fail __IDENTIFIER__ "$identifier"
+                '';
 
               meta = {
                 description = "Fast native Spotify client with local playback and Spotify Connect";
-                homepage = "https://fastpotify.rocks";
+                homepage = "https://spotifast.rocks";
                 license = pkgs.lib.licenses.mit;
-                mainProgram = "fastpotify";
+                mainProgram = "spotifast";
               };
             };
 
-          fastpotify-app =
-            let
-              version = pkgs.lib.getVersion fastpotify;
-              build = pkgs.lib.head (pkgs.lib.splitString "-" version);
-              icon =
-                pkgs.runCommand "fastpotify-icon"
-                  {
-                    nativeBuildInputs = [ pkgs.icnsify ];
-                  }
-                  ''
-                    icnsify ${./packaging/macos/icon-1024.png} -o $out
-                  '';
-            in
-            pkgs.runCommand "fastpotify-app"
-              {
-                meta = {
-                  description = "Fastpotify as a macOS app bundle";
-                  homepage = "https://fastpotify.rocks";
-                  license = pkgs.lib.licenses.mit;
-                  platforms = pkgs.lib.platforms.darwin;
-                };
-              }
-              ''
-                app="$out/Applications/Fastpotify.app/Contents"
-                mkdir -p "$app/MacOS" "$app/Resources"
-                cp ${fastpotify}/bin/fastpotify "$app/MacOS/fastpotify"
-                chmod 755 "$app/MacOS/fastpotify"
-                cp ${icon} "$app/Resources/fastpotify.icns"
-                sed -e "s/__VERSION__/${version}/g" -e "s/__BUILD__/${build}/g" \
-                  ${./packaging/macos/Info.plist} > "$app/Info.plist"
-                /usr/bin/codesign --force --sign - \
-                  "$out/Applications/Fastpotify.app"
-                /usr/bin/codesign --verify --strict \
-                  "$out/Applications/Fastpotify.app"
-              '';
         in
         {
-          default = fastpotify;
-          inherit fastpotify;
+          default = spotifast;
+          inherit spotifast;
         }
         // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isDarwin {
-          inherit fastpotify-app;
+          spotifast-app = spotifast;
         }
       );
 

@@ -34,10 +34,10 @@ else
     {
         printf '#!/bin/sh\nprintf "fake Lab version\\n"\n'
         if [[ ${BAD_IDENTITY:-0} == 0 ]]; then
-            printf '# %s\n' rocks.fastpotify.Lab.Instance org.mpris.MediaPlayer2.fastpotify_lab fastpotify-lab
+            printf '# %s\n' fastpotify_lab fastpotify-lab 'Fastpotify Lab'
         fi
-    } > "$CARGO_TARGET_DIR/debug/fastpotify"
-    chmod 755 "$CARGO_TARGET_DIR/debug/fastpotify"
+    } > "$CARGO_TARGET_DIR/debug/spotifast"
+    chmod 755 "$CARGO_TARGET_DIR/debug/spotifast"
 fi
 SH
 chmod 755 "$tmp/bin/nix" "$tmp/bin/cargo"
@@ -47,6 +47,7 @@ current="$XDG_DATA_HOME/fastpotify-lab-dev/current"
 first=$(readlink "$current")
 test -x "$first/run"
 test -s "$first/build-info"
+grep -Fx "repo=$tmp/repo" "$first/build-info"
 test "$(stat -c %a "$XDG_DATA_HOME/fastpotify-lab-dev")" = 700
 printf 'PASS: successful checked build is deployed with private storage\n'
 for failure in FAIL_SOURCE FAIL_TESTS FAIL_BUILD BAD_IDENTITY; do

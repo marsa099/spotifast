@@ -1,6 +1,6 @@
-# Contributing to Fastpotify
+# Contributing to Spotifast
 
-Fastpotify is a native Spotify client. Changes should improve the
+Spotifast is a native Spotify client. Changes should improve the
 desktop app without adding a browser, fallback services, or another backend.
 
 ## Before opening an issue
@@ -16,13 +16,13 @@ project.
 Some boundaries come from Spotify or from upstream libraries:
 
 - Local playback requires Spotify Premium because librespot requires it.
-- Spotify Lossless is not available through librespot. Fastpotify will
+- Spotify Lossless is not available through librespot. Spotifast will
   reconsider it if librespot gains lawful upstream support; proposals that
   depend on bypassing Spotify's DRM are out of scope.
 - Spotify tracks must come from Spotify. Substituting audio from YouTube,
   Piped, `yt-dlp`, or another catalogue is out of scope.
-- Fastpotify will not embed a browser engine, add telemetry, or introduce a
-  Fastpotify-operated service.
+- Spotifast will not embed a browser engine, add telemetry, or introduce a
+  Spotifast-operated service.
 
 [What Spotify Lets a Client Do](docs/_reference/what-spotify-allows.md)
 lists what each of the three surfaces offers and the requests none of them
@@ -38,32 +38,30 @@ but is not required for closure. Reopen the issue if it persists after updating.
 
 ## Automated triage
 
-Copilot assesses new and reopened issues, new discussions, and new or edited
-comments on either. It reads the full conversation again and can update triage
-labels when new evidence changes the report. Bot activity and pull request
-comments are ignored. Reopening a closed issue remains a maintainer decision.
+[Copilot Triage](https://github.com/crmne/copilot-triage) assesses new and
+reopened issues and new discussions. It uses the report and latest five
+comments plus previous bot replies, adds up to two labels, and may condense a
+long new issue into one concise recap. Follow-up replies must add help: a
+necessary question, supported answer, applicable policy, released fix, or useful
+issue link. Clear duplicates can be closed after comparison; related reports
+stay open. Maintainers handle uncertain decisions and removing obsolete labels.
 
-A rocket reaction on the triggering report or comment means that assessment
-completed successfully, including its safety checks and GitHub actions. It does
-not promise a reply, acceptance, or a fix. Clear reports may only receive a
-label. Replies ask for missing information or give a useful answer or decision;
-the agent does not repeat questions already answered or post status chatter.
-An assessment must record an applied action or an explicit no-action result.
-Missing outputs and failed safety checks cannot receive a completion marker.
+Human follow-ups can trigger reassessment. The agent decides whether a reply
+would help; repeated updates and thanks usually need none. Use `/triage` to
+request reassessment, `/triage mute` to stop automatic replies, or maintainer-only
+`/triage unmute` to resume them. You can also run **Issue assessment** from Actions
+with the report kind and number. Preview is enabled by default; turn it off to
+apply the result. The agent uses scoped read-only tools to investigate; only
+conversation state and the CLI installation are cached. A party-popper reaction
+marks a completed assessment,
+including one that needed no reply; it does not promise acceptance or a fix.
+Bot comments are skipped; configured error-monitoring bots can open reports.
+Model failures stay in the job summary.
 
-The marker is cleared when reassessing the same item and restored only after
-success. Failures can be retried from Actions without removing reactions by
-hand. Rockets placed before this behaviour was introduced only indicated an
-attempt had started. An older rocket never prevents a new assessment.
-
-The workflow is controlled by the `COPILOT_ISSUE_ASSESSMENT_ENABLED` repository
-variable. Edit `.github/workflows/issue-assessment.md`, then regenerate its
-lockfile with `gh aw compile issue-assessment` (gh-aw v0.88.7). The companion
-`issue-assessment-complete.yml` marks successful runs. Its small subject artifact
-contains only the GitHub node ID and, for comments, the assessed edit timestamp.
-Keep the workflow's Copilot CLI version pinned. A version update must pass a
-fresh hosted assessment with a recorded result; compilation alone does not
-exercise the connection to its tools.
+The `COPILOT_ISSUE_ASSESSMENT_ENABLED` repository variable controls the workflow.
+Edit `.github/triage.yml` for labels, replies, source files, and response policy.
+The shared action follows tested `v0` releases in `.github/workflows/issue-assessment.yml`; its
+implementation and regression tests live in the Copilot Triage repository.
 
 ## Design principles
 
@@ -86,7 +84,7 @@ exercise the connection to its tools.
 
 ## Pull requests
 
-Keep each pull request to one change. Explain why it belongs in Fastpotify,
+Keep each pull request to one change. Explain why it belongs in Spotifast,
 what changed, and how you tested it. Avoid unrelated formatting, refactors,
 generated prose, and large mechanical rewrites.
 
@@ -100,14 +98,79 @@ The same rules apply to hand-written and AI-assisted changes. The author must
 understand every line and answer review comments with specific reasoning.
 
 Code changes should include tests for behaviour that can regress. UI changes
-should include before/after screenshots or a short recording and should use
-demo mode where possible. User-visible behaviour, settings, files, or network
-access must be documented in the same pull request.
+should include before/after screenshots or a short recording in the pull
+request, not in the repository, and should use demo mode where possible.
+User-visible behaviour, settings, files, or network access must be documented
+in the same pull request.
+
+Dependencies come from crates.io or from repositories the maintainer owns
+under `github.com/crmne/`. A `git` dependency or `[patch]` entry may point only
+at such a repository, and adding or changing one needs the maintainer's
+explicit approval. Never point a dependency at your own fork or any other
+source. If a dependency needs a fix, send it upstream and link it from the pull
+request; the maintainer can carry it in a `crmne` fork until a release
+includes it. CI fails when `Cargo.toml`, `Cargo.lock` or `.cargo/config.toml`
+names any other git source or registry.
+
+### Settings
+
+Do not add a setting (a new field in `Settings`, a toggle, a slider, a choice
+of options) without the maintainer's approval in the issue first. The answer is
+usually no: prefer a good default that serves everyone, or a keyboard shortcut
+or command for the people who want something else. A pull request that adds a
+setting without that approval will be asked to remove it. CI fails when a pull
+request adds a field to a `Settings` struct in `src/settings.rs`, until the
+maintainer adds the `setting-approved` label.
+
+### Visual reviews
+
+Review evidence lives in the pull request, never in the repository. Attach
+captures and recordings to the pull request description, or to a comment when
+you update them, by dragging the files into GitHub's editor. Do not commit
+screenshots, comparison pages or recordings, under `docs/assets/` or anywhere
+else. CI fails when `docs/assets/` holds a file no page uses, or when an image,
+video or HTML file is named for a review (review, compare, comparison, before,
+after). Only images the project itself uses, such as a figure a documentation
+page shows or an icon the app draws, belong in the repository.
+
+Use actual before-and-after captures, from demo mode where possible. Match the
+data, page, interaction state, zoom and window size so the difference shows the
+proposed change. Identify the baseline and candidate, and report which
+platforms actually produced the captures.
+
+Lay the captures out in the description as a table with Before and After side
+by side, for light and dark themes at a narrow and a normal window size. Show
+relevant open menus, loading, error and empty states, and attach a short
+recording when the change moves. Explain the visible change briefly and list
+any remaining checks.
+
+An interactive HTML comparison, with theme and size selectors and Before and
+After buttons or a slider, helps with larger changes. Attach it to the pull
+request as one self-contained `.html` file with the captures embedded, which
+GitHub hands readers as a download to open in a browser, or publish it
+elsewhere, for example with GitHub Pages from your fork, and link it from the
+description. A gist does not work: GitHub shows its HTML as source.
+
+When reviewing several changes, provide one index with the PR number and name,
+a selector and Previous/Next controls, and a direct link to each comparison.
+Load only the selected review, and publish the index outside the repository
+too. The maintainer can approve by PR number and give exceptions or requested
+adjustments in a normal message.
+
+Visual approval covers the described appearance and interaction; integration
+still requires the relevant checks. Retain approval across rebases that preserve
+that scope. Implement explicitly requested adjustments and update the evidence;
+ask again only if the resulting scope goes beyond what was approved or requested.
+
+### Checks
 
 Run the same checks CI runs before submitting:
 
 ```sh
-node --test .github/scripts/issue-assessment.test.cjs
+python3 .github/scripts/check-dependency-sources.py
+python3 .github/scripts/check-review-evidence.py
+python3 .github/scripts/check-new-settings.py --base origin/main
+python3 packaging/test-launchers.py
 cargo fmt --all --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -118,8 +181,11 @@ RUSTDOCFLAGS='-D warnings' cargo doc --locked --all-features --no-deps
 (cd docs && bundle exec jekyll build)
 ```
 
-Linux needs the development packages listed in the README; `nix develop`
-provides the complete development environment. MilkDrop builds libprojectM
+Linux needs the development packages listed under
+[Build from source](https://spotifast.rocks/getting-started/#build-from-source); `nix develop`
+provides the complete development environment. The command compatibility test
+also needs `dbus-run-session`, to use a private bus instead of the desktop's.
+MilkDrop builds libprojectM
 from source, so every platform also needs CMake, a C++ compiler, and
 libclang (on Windows, vcpkg with `glew:x64-windows-static` installed and
 `VCPKG_INSTALLATION_ROOT` pointing at it); `--no-default-features` leaves
@@ -145,8 +211,13 @@ Translation changes also need `.github/scripts/update-translations.sh --check`,
 using GNU gettext tools with Rust support. Run the script without `--check` when
 translatable source strings change, and review any fuzzy or missing entries in
 the updated PO files. Normal Cargo builds compile the catalogs without gettext
-tools. See [Translating Fastpotify](docs/_reference/translating.md) for the pilot
-scope and contributor workflow.
+tools. See [Translating Spotifast](docs/_reference/translating.md) for language
+coverage and the contributor workflow.
+
+Documentation deployments take their canonical URL from the domain configured
+in GitHub Pages. When changing domains, configure DNS and GitHub Pages before
+redeploying; the previous hostname keeps working until that switch. Renamed
+guides use `jekyll-redirect-from` to preserve their old URLs.
 
 When changing `Cargo.lock` or `flake.nix`, also verify `nix build .#default`
 on a Nix host or wait for the Nix CI job. A package-version-only lockfile

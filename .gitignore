@@ -9,3 +9,7 @@ docs/.jekyll-cache/
 docs/vendor/
 docs/.bundle/
 .claude/
+
+/.cache/
+
+/dist/

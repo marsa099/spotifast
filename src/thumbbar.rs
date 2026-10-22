@@ -1,7 +1,7 @@
 //! The taskbar thumbnail toolbar: the transport buttons Windows draws
 //! underneath the window's preview.
 //!
-//! Not the same surface as `media_native.rs`. Those are the System Media
+//! Not the same surface as fastframe-now-playing's. Those are the System Media
 //! Transport Controls: they own the media keys and the volume overlay, they
 //! belong to a hidden window of their own, and they outlive the visible one
 //! so the tray keeps working. These buttons belong to the real window and
@@ -17,7 +17,7 @@
 //! `HICON`s at whatever size the system asks for and the app already
 //! compiles `tiny-skia` for the Winamp playlist's text. They follow the
 //! system's light or dark setting, not the app's: the preview flyout is
-//! Windows' own surface, so a Fastpotify set to Light on a dark desktop
+//! Windows' own surface, so a Spotifast set to Light on a dark desktop
 //! still needs light icons there.
 
 #[cfg(windows)]

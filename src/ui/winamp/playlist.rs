@@ -9,6 +9,7 @@ use egui::{Color32, Sense};
 
 use crate::api::models::PlayableItem;
 use crate::app::{App, NowPlaying};
+use crate::i18n::{gettext, pgettext};
 use crate::model::{Action, Page, RowContext};
 use crate::skin::layout::{self, Area};
 use crate::skin::sprites;
@@ -95,9 +96,7 @@ fn mini_transport(app: &mut App, view: &mut View, now: Option<&NowPlaying>, heig
         .enumerate()
     {
         let cell = Area::new(x + 10 * index as u32, y, 10, 10);
-        let response = view
-            .interact(cell, &format!("playlist-{name}"), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let response = view.interact(cell, &format!("playlist-{name}"), Sense::click());
         if !response.clicked() {
             continue;
         }
@@ -397,6 +396,14 @@ fn list(app: &mut App, view: &mut View, rows: &[Row], height: u32) {
     }
     app.winamp.playlist_scroll = app.winamp.playlist_scroll.min(most);
     let scroll = app.winamp.playlist_scroll;
+    let autoscroll_rect = view.rect(area);
+    crate::autoscroll::playlist(
+        view.ui,
+        autoscroll_rect,
+        scroll,
+        most,
+        layout::PLAYLIST_TRACK_HEIGHT as f32 * view.unit,
+    );
 
     let ctx = view.ui.ctx().clone();
     let clip = view.rect(area).intersect(view.ui.clip_rect());
@@ -415,6 +422,7 @@ fn list(app: &mut App, view: &mut View, rows: &[Row], height: u32) {
             egui::Id::new(("playlist-row", scroll + offset)),
             Sense::click(),
         );
+        crate::autoscroll::row(view.ui, &response);
         if response.clicked() {
             let adding = view.ui.ctx().input(|input| input.modifiers.command);
             // Selection is by row, not by song: the same song can sit in
@@ -616,16 +624,14 @@ fn menus(app: &mut App, view: &mut View, rows: &[Row], queue_uris: &[String], he
     let unit = view.unit;
     for (name, x) in layout::PLAYLIST_MENUS {
         let area = Area::new(x, bottom + 8, 22, 18);
-        let button = view
-            .interact(area, &format!("playlist-menu-{name}"), Sense::click())
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let button = view.interact(area, &format!("playlist-menu-{name}"), Sense::click());
         super::menu(
             egui::Popup::menu(&button),
             view.skin,
             unit,
             |ui| match name {
                 "add" => add_menu(app, ui),
-                "rem" => rem_menu(app, ui),
+                "rem" => rem_menu(app, ui, rows),
                 "sel" => sel_menu(app, ui, rows),
                 "misc" => misc_menu(app, ui, rows),
                 _ => list_menu(app, ui, rows, queue_uris),
@@ -636,22 +642,54 @@ fn menus(app: &mut App, view: &mut View, rows: &[Row], queue_uris: &[String], he
 
 /// Where a song comes from here: the big window's search or Liked Songs.
 fn add_menu(app: &mut App, ui: &mut egui::Ui) {
-    if ui.button("Search Spotify").clicked() {
+    let locale = app.locale;
+    if ui
+        .button(gettext(locale, "Search Spotify").as_ref())
+        .clicked()
+    {
         app.actions.push(Action::FocusSearch);
         app.actions.push(Action::ToggleWinampWindow);
     }
-    if ui.button("Liked Songs").clicked() {
+    if ui.button(gettext(locale, "Liked Songs").as_ref()).clicked() {
         app.actions.push(Action::Open(Page::LikedSongs));
         app.actions.push(Action::ToggleWinampWindow);
     }
 }
 
-fn rem_menu(app: &mut App, ui: &mut egui::Ui) {
-    ui.add_enabled(false, egui::Button::new("Remove selected"))
-        .on_disabled_hover_text("Spotify does not let apps remove one queued song.");
+fn rem_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row]) {
+    let locale = app.locale;
+    // Selection is by list row; only the songs the user queued can go.
+    let removable: Vec<(usize, String)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(row, _)| app.winamp.playlist_selection.contains(row))
+        .filter_map(|(_, row)| row.queued.map(|index| (index, row.uri.clone())))
+        .filter(|(index, _)| app.can_remove_from_queue(*index))
+        .collect();
+    let mut remove = ui.add_enabled(
+        !removable.is_empty(),
+        egui::Button::new(gettext(locale, "Remove selected").as_ref()),
+    );
+    if !app.queue_locally_reorderable() {
+        remove = remove.on_disabled_hover_text(
+            gettext(locale, "You can only change this computer's queue.").as_ref(),
+        );
+    }
+    if remove.clicked() {
+        // The rows below move up, so the selection's indexes would name
+        // other songs.
+        app.winamp.playlist_selection.clear();
+        app.actions
+            .push(Action::RemoveFromQueue { rows: removable });
+    }
     if ui
-        .add_enabled(app.can_clear_queue(), egui::Button::new("Remove all"))
-        .on_disabled_hover_text("You can only clear this computer's queue.")
+        .add_enabled(
+            app.can_clear_queue(),
+            egui::Button::new(gettext(locale, "Remove all").as_ref()),
+        )
+        .on_disabled_hover_text(
+            gettext(locale, "You can only clear this computer's queue.").as_ref(),
+        )
         .clicked()
     {
         app.actions.push(Action::ClearQueue);
@@ -659,14 +697,21 @@ fn rem_menu(app: &mut App, ui: &mut egui::Ui) {
 }
 
 fn sel_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row]) {
+    let locale = app.locale;
+    // Translators: Selects every song in the list.
+    let all = pgettext(locale, "selection", "All");
+    // Translators: Clears the selection of songs in the list.
+    let none = pgettext(locale, "selection", "None");
+    // Translators: Selects the songs that are not selected, and clears the rest.
+    let invert = pgettext(locale, "selection", "Invert");
     let selection = &mut app.winamp.playlist_selection;
-    if ui.button("All").clicked() {
+    if ui.button(all.as_ref()).clicked() {
         selection.extend(0..rows.len());
     }
-    if ui.button("None").clicked() {
+    if ui.button(none.as_ref()).clicked() {
         selection.clear();
     }
-    if ui.button("Invert").clicked() {
+    if ui.button(invert.as_ref()).clicked() {
         for index in 0..rows.len() {
             if !selection.remove(&index) {
                 selection.insert(index);
@@ -677,6 +722,7 @@ fn sel_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row]) {
 
 /// The pages of the selected song, or of the one playing.
 fn misc_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row]) {
+    let locale = app.locale;
     let chosen = rows
         .iter()
         .enumerate()
@@ -684,17 +730,20 @@ fn misc_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row]) {
         .map(|(_, row)| row)
         .or_else(|| rows.iter().find(|row| row.current));
     let Some(row) = chosen else {
-        ui.add_enabled(false, egui::Button::new("Song info"));
+        ui.add_enabled(
+            false,
+            egui::Button::new(gettext(locale, "Song info").as_ref()),
+        );
         return;
     };
     if let Some(album) = &row.album_id
-        && ui.button("Song info").clicked()
+        && ui.button(gettext(locale, "Song info").as_ref()).clicked()
     {
         app.actions.push(Action::Open(Page::Album(album.clone())));
         app.actions.push(Action::ToggleWinampWindow);
     }
     if let Some(artist) = &row.artist_id
-        && ui.button("Artist").clicked()
+        && ui.button(gettext(locale, "Artist").as_ref()).clicked()
     {
         app.actions.push(Action::Open(Page::Artist(artist.clone())));
         app.actions.push(Action::ToggleWinampWindow);
@@ -714,12 +763,18 @@ fn list_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row], queue_uris: &[Strin
                 .collect()
         })
         .unwrap_or_default();
-    ui.menu_button("Load list", |ui| {
-        egui::ScrollArea::vertical()
-            .max_height(super::menu_limit(ui))
-            .show(ui, |ui| {
+    let locale = app.locale;
+    ui.menu_button(gettext(locale, "Load list").as_ref(), |ui| {
+        crate::autoscroll::show(
+            ui,
+            egui::ScrollArea::vertical().max_height(super::menu_limit(ui)),
+            egui::Vec2b::new(false, true),
+            |ui| {
                 if playlists.is_empty() {
-                    ui.add_enabled(false, egui::Button::new("No playlists yet"));
+                    ui.add_enabled(
+                        false,
+                        egui::Button::new(gettext(locale, "No playlists yet").as_ref()),
+                    );
                 }
                 for (name, uri) in &playlists {
                     if ui.button(name).clicked() {
@@ -731,12 +786,16 @@ fn list_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row], queue_uris: &[Strin
                         ui.close();
                     }
                 }
-            });
+            },
+        );
     });
     let saveable = !queue_uris.is_empty() || rows.iter().any(|row| row.current);
     if ui
-        .add_enabled(saveable, egui::Button::new("Save list"))
-        .on_hover_text("Save the queue as a new playlist")
+        .add_enabled(
+            saveable,
+            egui::Button::new(gettext(locale, "Save list").as_ref()),
+        )
+        .on_hover_text(gettext(locale, "Save the queue as a new playlist").as_ref())
         .clicked()
     {
         let mut uris: Vec<String> = rows
@@ -776,5 +835,94 @@ mod tests {
         assert_eq!(rows_visible(116), 4);
         assert_eq!(rows_visible(174), 8);
         assert_eq!(list_area(174), Area::new(12, 20, 243, 116));
+    }
+
+    /// REM's Remove selected names queue rows, not list rows: the list
+    /// opens with the playing song, so a selected line sits one below its
+    /// place in the queue. Only the songs the user queued go (#721).
+    #[test]
+    fn remove_selected_takes_the_selected_queued_songs() {
+        use crate::app::AppOptions;
+        use crate::paths::AppDirs;
+        use crate::settings::Settings;
+        use egui::accesskit::{Action as Access, ActionRequest, Role, TreeId};
+
+        let root =
+            std::env::temp_dir().join(format!("spotifast-winamp-remove-{}", std::process::id()));
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let waker = crate::backend::Waker::default();
+        let mut app = App::new(
+            &waker,
+            AppDirs {
+                config: root.join("config"),
+                state: root.join("state"),
+                cache: root.join("cache"),
+            },
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                restore_sign_in: false,
+                tray: false,
+                autostart: false,
+            },
+        );
+        crate::demo::populate(&mut app);
+        let now = app.now_playing();
+        app.local_ready = true;
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: now.as_ref().unwrap().uri.clone(),
+            ..Default::default()
+        });
+        app.local.playback = crate::player::Playback::Paused;
+        let queued: Vec<String> = app.queue.get().unwrap().queue[..2]
+            .iter()
+            .map(|item| item.uri().to_string())
+            .collect();
+        app.manual_queue = queued.clone();
+        let (rows, _) = rows(&app, now.as_ref());
+        assert!(rows[0].current);
+        // The second queued song, and the first song of Next up after it.
+        app.winamp.playlist_selection.extend([2, 3]);
+
+        let frame = |app: &mut App, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ui| rem_menu(app, ui, &rows),
+            );
+            output.textures_delta.clear();
+            output.platform_output.accesskit_update.unwrap()
+        };
+        let tree = frame(&mut app, vec![]);
+        let remove = tree
+            .nodes
+            .iter()
+            .find(|(_, node)| {
+                node.label() == Some("Remove selected") && node.role() == Role::Button
+            })
+            .unwrap()
+            .0;
+        frame(
+            &mut app,
+            vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                target_tree: TreeId::ROOT,
+                target_node: remove,
+                action: Access::Click,
+                data: None,
+            })],
+        );
+        assert!(
+            matches!(
+                app.actions.as_slice(),
+                [Action::RemoveFromQueue { rows }] if *rows == [(1, queued[1].clone())]
+            ),
+            "{:?}",
+            app.actions
+        );
+        assert!(app.winamp.playlist_selection.is_empty());
+        app.backend.shutdown();
     }
 }
