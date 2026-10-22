@@ -1,22 +1,13 @@
-# Fastpotify Lab (Linux)
+# Spotifast Lab (Linux)
 
-An opt-in, pinned edition of the Vim-navigation fork. The original package is
-unchanged. Lab has a purple launcher icon and the display name **Fastpotify Lab**.
+This fork adds opt-in Vim navigation and Alt+H/L seeking to upstream Spotifast.
+Lab uses the **Spotifast Lab** name, purple icon, `spotifast-lab` window ID,
+`spotifast_lab` MPRIS identity and a separate profile. It does not register
+Spotify URI associations or replace the normal `spotifast` package.
 
-For a reproducible checkpoint build, from a checkout of this fork:
+## Incremental development
 
-```sh
-nix build --impure --file packaging/lab.nix
-nix profile install --impure --file packaging/lab.nix
-```
-
-Launch **Fastpotify Lab** from the application menu, or run `fastpotify-lab`.
-Installation does not launch the application or rebuild NixOS. With a fresh
-profile, enable **Vim keys** under **Settings → Keyboard** to test navigation.
-
-## Fast local development (recommended for UI iteration)
-
-Build once, then install the small permanent launcher from your checkout:
+From the long-lived `~/repos/spotifast` checkout:
 
 ```sh
 bash packaging/update-lab-dev.sh "$PWD"
@@ -24,82 +15,76 @@ nix profile add --priority 0 --impure --file packaging/lab-dev.nix \
   --argstr sourceRoot "$PWD" launcher
 ```
 
-Set `sourceRoot` to your long-lived checkout, not a disposable worktree. Once
-installed, update from that checkout or explicitly choose a task worktree:
+The installed commands are:
 
 ```sh
-fastpotify-lab-update
-fastpotify-lab-update /path/to/task-worktree
+spotifast-lab
+spotifast-lab-update
+spotifast-lab-update /path/to/task-worktree
 ```
 
-Restart Lab after a successful update. Updates do not launch or close windows,
-change settings, or copy credentials again. The original app remains separate.
+The updater tests and builds an isolated source snapshot. It never compiles in
+or patches the checkout. New files must be staged for the Git flake snapshot.
+Dependencies and unchanged source timestamps are cached across builds.
+MilkDrop and deterministic demo support are enabled.
 
-Current upstream is named **Spotifast**. Development builds use
-`lab-dev-identity.nix` to keep the existing `fastpotify-lab` launcher, window ID
-and XDG profile paths, with a separate `fastpotify_lab` MPRIS identity. The
-legacy pinned checkpoint still uses its original `lab.nix` identity patches.
-After updating from an older checkout, reinstall the small development launcher
-using the command above before using `fastpotify-lab-update`.
+Builds never open, close or restart application windows. Only a checked build
+atomically replaces `current`; `previous` retains the preceding generation.
+A running process keeps using its original binary. Restart it yourself when
+you want to use the selected new generation.
 
-Nix prepares an isolated source snapshot with these Lab identity patches. Tracked working-tree edits are included; newly added
-source files must be staged so the Git flake includes them. The checkout itself
-is never patched or built into. Cargo uses a stable private source directory and
-persistent target cache, with unchanged file timestamps preserved. Library tests
-and the application build share the dev profile and optimized dependencies.
-MilkDrop remains enabled; demo support is included for headless screenshots.
+Compilation cache lives under `$XDG_CACHE_HOME/spotifast-lab-dev`. Its `target/`
+directory is disposable; removing it only makes future builds slower.
+Installed generations and their runtime environment GC roots live under
+`$XDG_DATA_HOME/spotifast-lab-dev`, not in the compilation cache.
+Each `build-info` records the checkout path, immutable source snapshot and UTC
+build time. The checkout path alone is not proof of a clean Git revision.
 
-The first build warms the cache. Later edits reuse it instead of performing two
-clean optimized package builds. Changes to dependencies or the toolchain may
-still need a longer rebuild. This fast path does not replace full CI or checkpoint
-validation when preparing a stable version.
-
-Build state lives under `$XDG_CACHE_HOME/fastpotify-lab-dev` (normally
-`~/.cache/fastpotify-lab-dev`). Do not edit its managed source mirror. Installed
-builds and their per-generation Nix environment GC roots live under
-`$XDG_DATA_HOME/fastpotify-lab-dev` (normally `~/.local/share/fastpotify-lab-dev`),
-so clearing compilation caches does not remove the installed app or its libraries.
-Only checked builds replace the `current` symlink, atomically; `previous` retains
-the preceding successful generation. Failed updates keep the current build.
-Each generation's `build-info` records the original checkout path, the exact
-Nix source snapshot and the UTC build time. Updating repository source alone
-does not rebuild or replace an installed generation.
-
-Keep the lower-priority checkpoint package installed as a fallback. Removing the
-`fastpotify-lab-dev` profile entry restores that launcher without deleting Lab's
-settings or sign-in. Find exact entry names with `nix profile list`.
-
-Updater safety checks (no Rust compilation or real account access):
+Test updater rollback and isolation without compiling Rust or using an account:
 
 ```sh
 bash packaging/test-update-lab-dev.sh
 ```
 
-## Side-by-side isolation
+## Existing Lab installations
 
-- Config, state and cache use `fastpotify-lab` instead of `fastpotify` under the
-  normal XDG directories. Lab does not automatically copy an existing profile.
-- Credential storage retains the existing Secret Service service name but uses
-  a different profile key, derived from the Lab state path. Copying settings
-  alone does **not** copy a current version's protected sign-in credentials.
-- Window identity, single-instance channel, MPRIS name, tray identity and
-  desktop filename are separate. Lab does not register Spotify URI associations.
-- The default Spotify Connect device name is **Fastpotify Lab**. Keep it distinct
-  when importing settings: the Connect device ID is derived from that name.
+The previous Lab name was **Fastpotify Lab**. During a live rename, keep its
+existing config, state, application data and generations in place. New-named
+XDG paths can be symlinks to the corresponding `fastpotify-lab` and
+`fastpotify-lab-dev` directories. Do not move or delete files used by a running
+process, and never overwrite an existing new-named directory.
 
-Both clients still use the same Spotify account when credentials are copied.
-Account-side edits affect both clients, and Spotify playback restrictions still
-apply. Local profile isolation is not account isolation.
+The state directory's non-secret `credential-profile` records the SHA-256
+profile ID of the original state path, unless it already has a recorded ID.
+Lab deliberately retains its existing keyring service namespace in
+`lab-dev-identity.nix`; its profile remains separate from the normal app.
+Both are needed to preserve protected sign-in. Settings alone do not contain
+those credentials. Do not copy, print or export keyring secrets.
 
-## Updating or removing Lab
+The rename does not rewrite the saved Spotify Connect device name. Existing
+custom names and device identity are preserved; new profiles default to
+**Spotifast Lab**.
 
-The source revision is pinned in `lab.nix`. To test another revision, update that
-pin, rebuild and test the package, then reinstall it. Packaging substitutions use
-`--replace-fail` so source changes cannot silently disable isolation.
+A Super+N wrapper can recognize both old and new window IDs while the old
+window is still running, focusing it rather than starting a duplicate.
+After that window closes normally, the next launch uses the selected new build.
 
-Use `nix profile list` to find the installed Lab entry and
-`nix profile remove <entry-name>` to remove it. This leaves its settings and
-credentials intact and never removes the original app.
+## Reproducible package
 
-The package build runs the inherited Rust tests. No visible application is
-started during the build. Only Linux packaging is supported by this recipe.
+`lab.nix` builds the same identity transform as development builds, from this
+checkout and its locked dependencies:
+
+```sh
+nix build --impure --file packaging/lab.nix
+```
+
+Use a clean, committed checkout to identify a reproducible revision.
+Substitutions use `--replace-fail` so upstream identity changes cannot silently
+break isolation. The package runs inherited Rust tests without starting a GUI.
+Only Linux Lab packaging is supported.
+
+## Removal
+
+Use `nix profile list` to find the exact launcher/package entry before removing
+it with `nix profile remove <entry-name>`. Settings, credentials, installed
+generations and the normal Spotifast application are left alone.

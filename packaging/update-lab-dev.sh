@@ -22,21 +22,21 @@ if [[ ${1:-} == --build-inside ]]; then
     cargo test --locked --lib --features demo
     cargo build --locked --features demo
     binary="$CARGO_TARGET_DIR/debug/spotifast"
-    for marker in fastpotify_lab fastpotify-lab 'Fastpotify Lab'; do
+    for marker in spotifast_lab spotifast-lab 'Spotifast Lab'; do
         if ! grep -aFq "$marker" "$binary"; then
             echo 'Refusing to deploy a binary without the Lab identities.' >&2
             exit 1
         fi
     done
     "$binary" --version
-    install -m755 "$binary" "$generation/fastpotify"
+    install -m755 "$binary" "$generation/spotifast"
     # Capture the matching runtime environment, not a later shell's libraries.
     {
         printf '#!%s\n' "$(command -v bash)"
         # Preserve expansion of the launching process's environment at runtime.
         # shellcheck disable=SC2016
         printf 'export LD_LIBRARY_PATH=%q:"${LD_LIBRARY_PATH:-}"\n' "${LD_LIBRARY_PATH:-}"
-        printf 'exec %q "$@"\n' "$generation/fastpotify"
+        printf 'exec %q "$@"\n' "$generation/spotifast"
     } > "$generation/run"
     chmod 755 "$generation/run"
     "$generation/run" --version
@@ -44,12 +44,12 @@ if [[ ${1:-} == --build-inside ]]; then
 fi
 
 if [[ $# -ne 1 ]]; then
-    echo 'Usage: update-lab-dev.sh /path/to/fastpotify-checkout' >&2
+    echo 'Usage: update-lab-dev.sh /path/to/spotifast-checkout' >&2
     exit 2
 fi
 repo=$(git -C "$(realpath "$1")" rev-parse --show-toplevel)
-cache="${XDG_CACHE_HOME:-$HOME/.cache}/fastpotify-lab-dev"
-data="${XDG_DATA_HOME:-$HOME/.local/share}/fastpotify-lab-dev"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/spotifast-lab-dev"
+data="${XDG_DATA_HOME:-$HOME/.local/share}/spotifast-lab-dev"
 mkdir -p "$cache" "$data/generations"
 exec 9> "$cache/update.lock"
 flock -n 9 || { echo 'Another Lab update is already running.' >&2; exit 1; }
@@ -89,4 +89,4 @@ if [[ -L $data/current ]]; then
 fi
 ln -s "$generation" "$generation/current-link"
 mv -Tf "$generation/current-link" "$data/current"
-printf 'Lab updated in %s seconds. Restart Fastpotify Lab when ready.\n' "$SECONDS"
+printf 'Lab updated in %s seconds. Restart Spotifast Lab when ready.\n' "$SECONDS"

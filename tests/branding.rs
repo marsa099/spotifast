@@ -89,7 +89,12 @@ fn no_file_carries_the_old_name() {
                 .unwrap()
                 .to_string_lossy()
                 .into_owned();
-            let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_lowercase();
+            let mut text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).to_lowercase();
+            // Lab retains only this keyring namespace to read existing protected
+            // grants. It is not a user-facing app name or a source-wide exemption.
+            if relative == "src/credentials.rs" {
+                text = text.replace(&format!("rocks.{old}.{old}"), "");
+            }
             if relative.to_lowercase().contains(&old) || text.contains(&old) {
                 found.push(relative);
             }

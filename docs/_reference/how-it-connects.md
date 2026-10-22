@@ -142,6 +142,10 @@ still asks for all six types and nothing about a search changes.
 Since 0.8.0, verified Premium accounts using shared access see a
 one-time introduction to that option. Setup and dismissal are remembered in
 settings. The prompt uses the existing account profile and adds no request.
+When Spotify answers a shared-app Web API request with "too
+many requests" (HTTP 429), those accounts also see a banner offering the same
+setup, at most once a day and never again after it was closed three times.
+It reads the answer the request already received and adds no request.
 
 Since 0.8.0, explicitly sorting a Library section loads its remaining
 pages through the existing Web API grant, one at a time, while loaded entries
@@ -211,8 +215,9 @@ out, or a reconnection that gives up stops it.
   while the saved rows remain visible. Manual refresh starts immediately.
   Like and Unlike are kept over lagging reads until Spotify confirms them.
 - Spotifast has no telemetry, analytics, or hosted service. When the lyrics
-  panel is open and Spotify has no lyrics, it sends the track's artist, title,
-  album, and length to [lrclib.net](https://lrclib.net). It also checks
+  panel is open and neither Spotify nor a local file has lyrics, it sends
+  the track's artist, title, album, and length to
+  [lrclib.net](https://lrclib.net). It also checks
   api.github.com once a day for updates. You can turn off automatic checks in
   Settings, or request one there at any time. On macOS, **Check for Updates**
   is also in the application menu. On a connection the system reports as
@@ -603,11 +608,13 @@ Nothing is wasted when the song then plays: its load uses all three.
 Skipping further than two songs ahead loads the song as before. These
 requests go through the playback session and use no Web API quota.
 
-When the PulseAudio backend is selected on Linux, its PulseAudio or PipeWire
-stream is named **Spotifast**, with **Spotify playback** as its description, so
-system mixers and audio processors can identify and route it. Explicit
-`PULSE_PROP_application.name` and `PULSE_PROP_stream.description` environment
-values take precedence.
+Local playback has one output on every platform, fastframe-audio: CoreAudio on
+macOS, WASAPI on Windows, and on Linux PipeWire when it is running, otherwise a
+PulseAudio server, otherwise ALSA directly. It talks only to the local sound
+system. On PipeWire and PulseAudio the stream is named **Spotifast** in system
+mixers (`application.name`, with the `spotifast` icon), with **Spotify
+playback** as its media name and no media role, so its volume is remembered
+for Spotifast rather than shared with other music players.
 The same session checks releases that the Web API calls `single`, so confirmed
 EPs can carry their precise label. Spotifast deduplicates these checks while
 the app session is active. If the engine reconnects, an interrupted check may

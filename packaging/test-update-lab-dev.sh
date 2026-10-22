@@ -3,7 +3,7 @@
 set -euo pipefail
 umask 077
 script=$(realpath "$(dirname "$0")/update-lab-dev.sh")
-tmp=$(mktemp -d /tmp/fastpotify-lab-updater-test.XXXXXXXX)
+tmp=$(mktemp -d /tmp/spotifast-lab-updater-test.XXXXXXXX)
 mkdir -p "$tmp/bin" "$tmp/repo/packaging" "$tmp/source"
 git -C "$tmp/repo" init -q
 printf 'initial\n' > "$tmp/source/example.rs"
@@ -17,7 +17,7 @@ if [[ $1 == build ]]; then
     printf '%s\n' "$FAKE_SOURCE"
 else
     [[ $2 == "path:$FAKE_SOURCE" ]]
-    [[ $3 == --profile && $4 == "$XDG_DATA_HOME/fastpotify-lab-dev/generations/"*/environment ]]
+    [[ $3 == --profile && $4 == "$XDG_DATA_HOME/spotifast-lab-dev/generations/"*/environment ]]
     while [[ $1 != --command ]]; do shift; done
     shift
     exec "$@"
@@ -34,7 +34,7 @@ else
     {
         printf '#!/bin/sh\nprintf "fake Lab version\\n"\n'
         if [[ ${BAD_IDENTITY:-0} == 0 ]]; then
-            printf '# %s\n' fastpotify_lab fastpotify-lab 'Fastpotify Lab'
+            printf '# %s\n' spotifast_lab spotifast-lab 'Spotifast Lab'
         fi
     } > "$CARGO_TARGET_DIR/debug/spotifast"
     chmod 755 "$CARGO_TARGET_DIR/debug/spotifast"
@@ -43,12 +43,12 @@ SH
 chmod 755 "$tmp/bin/nix" "$tmp/bin/cargo"
 run() { bash "$script" "$tmp/repo" > "$tmp/run.log" 2>&1; }
 run
-current="$XDG_DATA_HOME/fastpotify-lab-dev/current"
+current="$XDG_DATA_HOME/spotifast-lab-dev/current"
 first=$(readlink "$current")
 test -x "$first/run"
 test -s "$first/build-info"
 grep -Fx "repo=$tmp/repo" "$first/build-info"
-test "$(stat -c %a "$XDG_DATA_HOME/fastpotify-lab-dev")" = 700
+test "$(stat -c %a "$XDG_DATA_HOME/spotifast-lab-dev")" = 700
 printf 'PASS: successful checked build is deployed with private storage\n'
 for failure in FAIL_SOURCE FAIL_TESTS FAIL_BUILD BAD_IDENTITY; do
     if env "$failure=1" bash "$script" "$tmp/repo" > "$tmp/run.log" 2>&1; then
@@ -58,32 +58,32 @@ for failure in FAIL_SOURCE FAIL_TESTS FAIL_BUILD BAD_IDENTITY; do
     test "$(readlink "$current")" = "$first"
 done
 printf 'PASS: source, test, build and identity failures preserve the previous build\n'
-mtime=$(stat -c %y "$XDG_CACHE_HOME/fastpotify-lab-dev/src/example.rs")
+mtime=$(stat -c %y "$XDG_CACHE_HOME/spotifast-lab-dev/src/example.rs")
 sleep 1
 run
-test "$(stat -c %y "$XDG_CACHE_HOME/fastpotify-lab-dev/src/example.rs")" = "$mtime"
-test "$(readlink "$XDG_DATA_HOME/fastpotify-lab-dev/previous")" = "$first"
+test "$(stat -c %y "$XDG_CACHE_HOME/spotifast-lab-dev/src/example.rs")" = "$mtime"
+test "$(readlink "$XDG_DATA_HOME/spotifast-lab-dev/previous")" = "$first"
 printf 'PASS: unchanged source keeps mtimes; the prior generation is retained\n'
 printf 'changed\n' > "$tmp/source/example.rs"
-touch -r "$XDG_CACHE_HOME/fastpotify-lab-dev/src/example.rs" "$tmp/source/example.rs"
+touch -r "$XDG_CACHE_HOME/spotifast-lab-dev/src/example.rs" "$tmp/source/example.rs"
 sleep 1
 run
-test "$(stat -c %y "$XDG_CACHE_HOME/fastpotify-lab-dev/src/example.rs")" != "$mtime"
+test "$(stat -c %y "$XDG_CACHE_HOME/spotifast-lab-dev/src/example.rs")" != "$mtime"
 printf 'PASS: changed contents invalidate Cargo even with unchanged source timestamps\n'
 latest=$(readlink "$current")
-exec 8> "$XDG_CACHE_HOME/fastpotify-lab-dev/update.lock"
+exec 8> "$XDG_CACHE_HOME/spotifast-lab-dev/update.lock"
 flock -n 8
 if run; then echo 'FAIL: concurrent update was allowed' >&2; exit 1; fi
 flock -u 8
 exec 8>&-
 test "$(readlink "$current")" = "$latest"
-mkdir -p "$tmp/unmanaged/fastpotify-lab-dev/src"
-printf 'keep\n' > "$tmp/unmanaged/fastpotify-lab-dev/src/user-file"
+mkdir -p "$tmp/unmanaged/spotifast-lab-dev/src"
+printf 'keep\n' > "$tmp/unmanaged/spotifast-lab-dev/src/user-file"
 if XDG_CACHE_HOME="$tmp/unmanaged" run; then echo 'FAIL: unmanaged source was overwritten' >&2; exit 1; fi
-test -f "$tmp/unmanaged/fastpotify-lab-dev/src/user-file"
+test -f "$tmp/unmanaged/spotifast-lab-dev/src/user-file"
 test "$(readlink "$current")" = "$latest"
-mkdir -p "$tmp/unmanaged-data/fastpotify-lab-dev"
-printf 'keep\n' > "$tmp/unmanaged-data/fastpotify-lab-dev/current"
+mkdir -p "$tmp/unmanaged-data/spotifast-lab-dev"
+printf 'keep\n' > "$tmp/unmanaged-data/spotifast-lab-dev/current"
 if XDG_DATA_HOME="$tmp/unmanaged-data" run; then echo 'FAIL: unmanaged data was overwritten' >&2; exit 1; fi
-test "$(<"$tmp/unmanaged-data/fastpotify-lab-dev/current")" = keep
+test "$(<"$tmp/unmanaged-data/spotifast-lab-dev/current")" = keep
 printf 'PASS: concurrent updates and unmanaged source/data overwrites are refused\n'
