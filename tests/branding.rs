@@ -57,6 +57,7 @@ fn no_file_carries_the_old_name() {
         root.join("packaging/lab.nix"),
         root.join("packaging/lab-dev.nix"),
         root.join("packaging/lab-dev-identity.nix"),
+        root.join("packaging/fork-update/lab-identity.json"),
         root.join("packaging/update-lab-dev.sh"),
         root.join("packaging/test-update-lab-dev.sh"),
     ];

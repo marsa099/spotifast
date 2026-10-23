@@ -8,6 +8,7 @@ let
   pkgs = import fork.inputs.nixpkgs { inherit system; };
   base = fork.packages.${system}.spotifast;
   labIdentity = import ./lab-dev-identity.nix;
+  updater = import ./fork-update/package.nix { inherit pkgs; };
   desktop = pkgs.makeDesktopItem {
     name = "spotifast-lab";
     desktopName = "Spotifast Lab";
@@ -26,6 +27,8 @@ base.overrideAttrs (old: {
   postPatch = (old.postPatch or "") + labIdentity;
   postInstall = ''
     mv "$out/bin/spotifast" "$out/bin/spotifast-lab"
+    cp -R ${updater}/bin/. "$out/bin/"
+    cp -R ${updater}/share/. "$out/share/"
     install -Dm644 ${desktop}/share/applications/spotifast-lab.desktop \
       "$out/share/applications/spotifast-lab.desktop"
     install -Dm644 packaging/icons/spotifast.svg \

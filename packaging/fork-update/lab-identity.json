@@ -1,0 +1,58 @@
+[
+  {
+    "path": "src/paths.rs",
+    "replacements": [
+      ["\"spotifast\"", "\"spotifast-lab\""],
+      ["\"spotifast-config\"", "\"spotifast-lab-config\""],
+      ["\"spotifast-state\"", "\"spotifast-lab-state\""],
+      ["\"spotifast-cache\"", "\"spotifast-lab-cache\""]
+    ]
+  },
+  {
+    "path": "src/single_instance.rs",
+    "replacements": [["const NAME: &str = \"spotifast\";", "const NAME: &str = \"spotifast-lab\";"]]
+  },
+  {
+    "path": "src/credentials.rs",
+    "replacements": [["\"rocks.spotifast.Spotifast\"", "\"rocks.fastpotify.Fastpotify\""]]
+  },
+  {
+    "path": "src/app.rs",
+    "replacements": [
+      ["fastframe_now_playing::App::new(\"spotifast\", \"Spotifast\");", "fastframe_now_playing::App::new(\"spotifast_lab\", \"Spotifast Lab\"); app.desktop_entry = \"spotifast-lab\".into();"],
+      ["id: \"spotifast\"", "id: \"spotifast-lab\""],
+      ["\"org.mpris.MediaPlayer2.spotifast\"", "\"org.mpris.MediaPlayer2.spotifast_lab\""],
+      ["\"Spotifast\"", "\"Spotifast Lab\""],
+      ["{} - Spotifast", "{} - Spotifast Lab"]
+    ]
+  },
+  {
+    "path": "src/entrypoint.rs",
+    "replacements": [["\"spotifast\"", "\"spotifast-lab\""], ["\"Spotifast\"", "\"Spotifast Lab\""]]
+  },
+  {
+    "path": "src/sink.rs",
+    "replacements": [["\"Spotifast\"", "\"Spotifast Lab\""], ["\"spotifast\"", "\"spotifast-lab\""]]
+  },
+  {
+    "path": "src/backend.rs",
+    "replacements": [["Autostart::new(\"spotifast\", \"Spotifast\")", "Autostart::new(\"spotifast-lab\", \"Spotifast Lab\")"]]
+  },
+  {
+    "path": "src/settings.rs",
+    "replacements": [["device_name: \"Spotifast\".to_string()", "device_name: \"Spotifast Lab\".to_string()"]]
+  },
+  {
+    "path": "tests/branding.rs",
+    "replacements": [["Settings::default().device_name, \"Spotifast\"", "Settings::default().device_name, \"Spotifast Lab\""]]
+  },
+  {
+    "path": "packaging/icons/spotifast.svg",
+    "replacements": [
+      ["#18c055", "#8b5cf6"], ["#0c8a3a", "#6d28d9"],
+      ["#5cf095", "#c4b5fd"], ["#1ed760", "#a78bfa"],
+      ["#15b650", "#8b5cf6"], ["#d9ffe8", "#ede9fe"],
+      ["#7bf0aa", "#c4b5fd"], ["#0a6e2e", "#5b21b6"]
+    ]
+  }
+]

@@ -7,6 +7,7 @@
 let
   pkgs = import fork.inputs.nixpkgs { inherit system; };
   labIdentity = import ./lab-dev-identity.nix;
+  updater = import ./fork-update/package.nix { inherit pkgs; };
   source = pkgs.runCommand "spotifast-lab-dev-source" { } ''
     mkdir -p "$out"
     cp -R ${fork.outPath}/. "$out/"
@@ -15,6 +16,7 @@ let
     ${labIdentity}
   '';
   launch = pkgs.writeShellScriptBin "spotifast-lab" ''
+    export SPOTIFAST_FORK_UPDATER=${updater}/bin/spotifast-fork-updater
     data="''${XDG_DATA_HOME:-$HOME/.local/share}/spotifast-lab-dev"
     generation=$(${pkgs.coreutils}/bin/readlink -e "$data/current") || {
       echo 'Lab has no development build yet. Run spotifast-lab-update first.' >&2

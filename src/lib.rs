@@ -16,6 +16,7 @@ pub mod demo;
 pub mod device_history;
 pub mod emoji;
 pub mod eq;
+pub mod fork_updates;
 pub mod history;
 pub mod http;
 pub mod i18n;

@@ -800,6 +800,10 @@ pub enum Command {
         source: crate::updates::Source,
     },
     InspectUpdate,
+    ForkUpdate {
+        client: crate::fork_updates::Client,
+        request: crate::fork_updates::Request,
+    },
     DownloadUpdate {
         release: crate::updates::Release,
         source: crate::updates::Source,
@@ -952,6 +956,9 @@ pub enum Event {
         config: ProxyConfig,
         result: Result<bool, String>,
     },
+    ForkUpdateStatus(crate::fork_updates::Snapshot),
+    ForkUpdateAttached(Result<(), String>),
+    ForkUpdateActivated(Result<(), String>),
     UpdateSupport(Result<crate::updates::Installation, String>),
     UpdateProgress {
         received: u64,
@@ -1301,6 +1308,7 @@ impl Backend {
                     | Command::Shutdown
                     | Command::CheckForUpdates { .. }
                     | Command::InspectUpdate
+                    | Command::ForkUpdate { .. }
                     | Command::DownloadUpdate { .. }
                     | Command::InstallUpdate { .. }
             )
@@ -2488,6 +2496,37 @@ impl Worker {
                 Command::ActivateReceiver(receiver) => self.activate_receiver(*receiver),
                 Command::CheckForUpdates { manual, source } => {
                     self.check_for_updates(manual, source)
+                }
+                Command::ForkUpdate { client, request } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let status_events = events.clone();
+                        let status_waker = waker.clone();
+                        let result = client.execute(&request, move |snapshot| {
+                            let sent = status_events
+                                .send(Event::ForkUpdateStatus(snapshot))
+                                .is_ok();
+                            status_waker.wake();
+                            sent
+                        });
+                        match request {
+                            crate::fork_updates::Request::Start { .. } => {
+                                if let Err(error) = result {
+                                    let _ = events.send(Event::ForkUpdateStatus(
+                                        crate::fork_updates::Snapshot::failed(error),
+                                    ));
+                                }
+                            }
+                            crate::fork_updates::Request::Attach => {
+                                let _ = events.send(Event::ForkUpdateAttached(result));
+                            }
+                            crate::fork_updates::Request::Activate { .. } => {
+                                let _ = events.send(Event::ForkUpdateActivated(result));
+                            }
+                        }
+                        waker.wake();
+                    });
                 }
                 Command::InspectUpdate => {
                     let proxy = self.engine_config.proxy.clone();

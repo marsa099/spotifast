@@ -1285,6 +1285,7 @@ pub enum Action {
     /// Ask GitHub for the latest release and report the result to the user.
     CheckForUpdates,
     ShowUpdate,
+    OpenUpdateTerminal,
     DownloadUpdate,
     InstallUpdate,
     SettingsChanged,
