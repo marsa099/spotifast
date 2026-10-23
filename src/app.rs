@@ -768,6 +768,7 @@ pub struct App {
     pub update_download: crate::updates::DownloadState,
     pub update_source: crate::updates::Source,
     pub update_support: Option<Result<crate::updates::Installation, String>>,
+    pub fork_update: Option<crate::fork_updates::Client>,
     pub update_restart_arguments: Vec<String>,
     pub update_receipt: Option<fastframe_update::Receipt>,
     held_update: Option<HeldUpdate>,
@@ -1027,6 +1028,7 @@ impl App {
             .unwrap_or(Page::Home);
 
         let palette = settings.fixed_palette().unwrap_or_else(Palette::dark);
+        let fork_update = crate::fork_updates::Client::discover(&dirs.state);
         let mut app = Self {
             custom_themes: theme::Catalog::default(),
             dirs,
@@ -1294,6 +1296,7 @@ impl App {
             update_download: crate::updates::DownloadState::Idle,
             update_source: crate::updates::Source::default(),
             update_support: None,
+            fork_update,
             update_restart_arguments: Vec::new(),
             update_receipt: None,
             held_update: None,
@@ -2649,6 +2652,36 @@ impl App {
                     Err(error) => log::debug!("album type unavailable for {uri}: {error}"),
                 },
                 Event::WebApp { client_id } => self.web_app = client_id,
+                Event::ForkUpdateStatus(snapshot) => {
+                    let needs_input = self.fork_update.as_ref().is_some_and(|client| {
+                        snapshot.phase == "needs_input" && client.status.phase != "needs_input"
+                    });
+                    if let Some(client) = &mut self.fork_update {
+                        client.pending = false;
+                        client.status = snapshot;
+                    }
+                    if needs_input {
+                        self.toast("The update needs your input. Open the update dialog to attach to its terminal.".to_owned());
+                    }
+                }
+                Event::ForkUpdateAttached(result) => {
+                    if let Err(error) = result {
+                        self.toast_error(error);
+                    }
+                }
+                Event::ForkUpdateActivated(result) => {
+                    if let Some(client) = &mut self.fork_update {
+                        client.pending = false;
+                    }
+                    match result {
+                        Ok(()) => self.actions.push(Action::Quit),
+                        Err(error) => {
+                            if let Some(client) = &mut self.fork_update {
+                                client.status = crate::fork_updates::Snapshot::failed(error);
+                            }
+                        }
+                    }
+                }
                 Event::UpdateSupport(result) => {
                     if result.is_ok()
                         && self.settings.download_updates_automatically
@@ -11483,12 +11516,31 @@ impl App {
             Action::CheckForUpdates => self.check_for_updates(true),
             Action::ShowUpdate => {
                 self.show_update = true;
-                if self.update_support.is_none() {
+                if self.fork_update.is_some() {
+                    self.start_fork_update();
+                } else if self.update_source.is_github() {
+                    self.update_support = Some(Err("The fork updater companion is missing. Install the Lab companion or build this fork manually; upstream binaries will not be installed.".into()));
+                } else if self.update_support.is_none() {
                     self.backend.send(Command::InspectUpdate);
                 }
             }
+            Action::OpenUpdateTerminal => {
+                if let Some(client) = &self.fork_update {
+                    self.backend.send(Command::ForkUpdate {
+                        client: client.clone(),
+                        request: crate::fork_updates::Request::Attach,
+                    });
+                }
+            }
             Action::DownloadUpdate => {
-                if matches!(
+                if self.fork_update.is_some() {
+                    self.start_fork_update();
+                } else if self.update_source.is_github() {
+                    self.update_download = crate::updates::DownloadState::Failed(
+                        "Fork updater companion missing; refusing a vanilla upstream binary."
+                            .into(),
+                    );
+                } else if matches!(
                     self.update_download,
                     crate::updates::DownloadState::Idle | crate::updates::DownloadState::Failed(_)
                 ) && let Some(release) = self.update.clone()
@@ -11504,13 +11556,30 @@ impl App {
                 }
             }
             Action::InstallUpdate => {
-                if matches!(
+                if let Some(client) = &mut self.fork_update {
+                    if client.status.ready() && !client.pending {
+                        client.pending = true;
+                        self.backend.send(Command::ForkUpdate {
+                            client: client.clone(),
+                            request: crate::fork_updates::Request::Activate {
+                                pid: std::process::id(),
+                            },
+                        });
+                    }
+                } else if self.update_source.is_github() {
+                    self.toast_error(
+                        "Fork updater companion missing; refusing a vanilla upstream installation."
+                            .to_owned(),
+                    );
+                } else if matches!(
                     self.update_download,
                     crate::updates::DownloadState::Ready(_)
-                ) && let crate::updates::DownloadState::Ready(prepared) = std::mem::replace(
-                    &mut self.update_download,
-                    crate::updates::DownloadState::Installing,
-                ) {
+                ) && let crate::updates::DownloadState::Ready(prepared) =
+                    std::mem::replace(
+                        &mut self.update_download,
+                        crate::updates::DownloadState::Installing,
+                    )
+                {
                     self.backend.send(Command::InstallUpdate {
                         prepared,
                         arguments: self.update_restart_arguments.clone(),
@@ -12395,9 +12464,45 @@ impl App {
         conditions.metered || (self.follows_reachability && !conditions.online)
     }
 
+    fn start_fork_update(&mut self) {
+        let Some(release) = &self.update else {
+            return;
+        };
+        let Some(client) = &mut self.fork_update else {
+            return;
+        };
+        if client.pending {
+            return;
+        }
+        if self.offline {
+            client.status = crate::fork_updates::Snapshot::failed(
+                "Fork updates do not run in demo/offline mode.",
+            );
+            return;
+        }
+        client.pending = true;
+        if !client.status.active() && !client.status.ready() {
+            client.status.phase = "starting".into();
+            client.status.version = release.version.to_string();
+            client.status.message = "Starting fork compatibility checks…".into();
+        }
+        self.backend.send(Command::ForkUpdate {
+            client: client.clone(),
+            request: crate::fork_updates::Request::Start {
+                version: release.version.to_string(),
+            },
+        });
+    }
+
     /// Takes an automatic update step now, or holds it until the connection
     /// is neither metered nor down.
     fn take_update_step(&mut self, step: HeldUpdate) {
+        if self.fork_update.is_some() || self.update_source.is_github() {
+            // Release discovery may run as before. Source integration, agents,
+            // downloads, builds and installation always require a user click.
+            self.held_update = None;
+            return;
+        }
         if self.downloads_wait() {
             self.held_update = Some(step);
             return;
@@ -22813,12 +22918,10 @@ mod tests {
         }
     }
 
-    /// An automatic download put off on a metered connection starts once the
-    /// connection is not, rather than at the next daily check, and not while
-    /// the connection is down: a download that fails would stop the next
-    /// automatic one.
+    /// Returning to an unmetered connection never starts a fork build or
+    /// downloads an upstream binary, even with automatic downloads enabled.
     #[test]
-    fn an_update_held_on_a_metered_connection_downloads_when_it_is_not() {
+    fn a_fork_update_stays_idle_when_the_connection_returns() {
         use crate::updates::{DownloadState, Installation, Kind};
         let mut app = headless_app();
         app.settings.download_updates_automatically = true;
@@ -22861,16 +22964,14 @@ mod tests {
 
         change_power(&app, |conditions| conditions.online = true);
         pass(&mut app);
-        assert!(matches!(
-            app.update_download,
-            DownloadState::Downloading { .. }
-        ));
+        assert!(matches!(app.update_download, DownloadState::Idle));
+        assert!(app.held_update.is_none(), "queued an automatic fork update");
     }
 
-    /// A step held while automatic downloads are off waits for them to be
-    /// turned back on, rather than being dropped when the network comes back.
+    /// Toggling the old automatic-download preference cannot start source
+    /// integration or download a vanilla binary in this fork.
     #[test]
-    fn a_held_update_waits_for_automatic_downloads_to_be_turned_on() {
+    fn automatic_download_settings_do_not_start_fork_updates() {
         use crate::updates::{DownloadState, Installation, Kind};
         let mut app = headless_app();
         app.settings.download_updates_automatically = true;
@@ -22892,20 +22993,38 @@ mod tests {
             output.textures_delta.clear();
         };
         pass(&mut app);
-        assert!(app.held_update.is_some());
+        assert!(app.held_update.is_none());
 
         app.settings.download_updates_automatically = false;
         change_power(&app, |conditions| conditions.metered = false);
         pass(&mut app);
         assert!(matches!(app.update_download, DownloadState::Idle));
-        assert!(app.held_update.is_some(), "dropped while turned off");
+        assert!(app.held_update.is_none(), "queued while turned off");
 
         app.settings.download_updates_automatically = true;
         pass(&mut app);
+        assert!(matches!(app.update_download, DownloadState::Idle));
+        assert!(app.held_update.is_none());
+    }
+
+    #[test]
+    fn a_missing_fork_companion_cannot_download_a_vanilla_binary() {
+        let mut app = headless_app();
+        app.fork_update = None;
+        assert!(app.update_source.is_github());
+        app.update = Some(crate::updates::Release {
+            version: "9.9.9".into(),
+            url: "https://example.invalid/release".into(),
+        });
+        let ctx = egui::Context::default();
+        app.apply(Action::ShowUpdate, &ctx);
+        assert!(matches!(app.update_support, Some(Err(_))));
+        app.apply(Action::DownloadUpdate, &ctx);
         assert!(matches!(
             app.update_download,
-            DownloadState::Downloading { .. }
+            crate::updates::DownloadState::Failed(_)
         ));
+        assert!(app.held_update.is_none());
     }
 
     /// MPRIS hands the desktop the artwork URL and reads no file, so the

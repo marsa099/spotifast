@@ -3284,6 +3284,9 @@ mod tests {
         use crate::updates::{DownloadState, Installation, Kind, Prepared};
         use egui::accesskit::{Action as AccessibleAction, Role};
         let (ctx, mut app) = accessible_app("update-window");
+        // This fork refuses vanilla GitHub binaries; the demo feed still
+        // exercises the shared download dialog.
+        app.update_source = fastframe_update::Source::local("http://127.0.0.1:9").unwrap();
         app.update = Some(crate::updates::Release {
             version: "9.9.9".into(),
             url: "https://example.invalid/release".into(),
