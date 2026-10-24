@@ -22,6 +22,9 @@ pub struct Snapshot {
     pub session: String,
     pub pid: u32,
     pub updated_at: u64,
+    pub started_at: u64,
+    /// Seconds the last successful run took, for the next estimate.
+    pub last_duration_s: u64,
 }
 
 impl Snapshot {
@@ -49,6 +52,25 @@ impl Snapshot {
 
     pub fn ready(&self) -> bool {
         self.phase == "ready"
+    }
+
+    /// Whole minutes the current run has taken so far.
+    pub fn elapsed_minutes(&self, now: u64) -> Option<u64> {
+        (self.started_at > 0 && now >= self.started_at).then(|| (now - self.started_at) / 60)
+    }
+
+    /// Minutes the last successful run took, rounded up.
+    pub fn last_minutes(&self) -> Option<u64> {
+        (self.last_duration_s > 0).then(|| self.last_duration_s.div_ceil(60))
+    }
+
+    /// Minutes left at the last run's pace; zero once past it.
+    pub fn remaining_minutes(&self, now: u64) -> Option<u64> {
+        let elapsed = now
+            .checked_sub(self.started_at)
+            .filter(|_| self.started_at > 0)?;
+        (self.last_duration_s > 0)
+            .then(|| self.last_duration_s.saturating_sub(elapsed).div_ceil(60))
     }
 
     fn validate(self) -> Result<Self, String> {
@@ -115,7 +137,11 @@ impl Client {
         if !helper.is_absolute() || !helper.is_file() {
             return None;
         }
-        Some(Self::at(helper, state.join("fork-updater")))
+        let mut client = Self::at(helper, state.join("fork-updater"));
+        if let Ok(status) = client.read_status() {
+            client.status = status;
+        }
+        Some(client)
     }
 
     pub fn at(helper: PathBuf, state: PathBuf) -> Self {
@@ -280,6 +306,24 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn estimates_follow_the_last_successful_run() {
+        let fresh = Snapshot::default();
+        assert_eq!(fresh.last_minutes(), None);
+        assert_eq!(fresh.remaining_minutes(1_000), None);
+        assert_eq!(fresh.elapsed_minutes(1_000), None);
+        let running = Snapshot {
+            started_at: 1_000,
+            last_duration_s: 1_201,
+            ..Snapshot::default()
+        };
+        assert_eq!(running.last_minutes(), Some(21));
+        assert_eq!(running.elapsed_minutes(1_000 + 600), Some(10));
+        assert_eq!(running.remaining_minutes(1_000 + 600), Some(11));
+        assert_eq!(running.remaining_minutes(1_000 + 5_000), Some(0));
+        assert_eq!(running.elapsed_minutes(10), None, "clock went backwards");
     }
 
     #[test]

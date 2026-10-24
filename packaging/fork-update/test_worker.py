@@ -115,6 +115,22 @@ class WorkerTests(unittest.TestCase):
         self.assertIn("--userns=keep-id", args)
         self.assertIn(f"{os.getuid()}:{os.getgid()}", args)
 
+    def test_successful_run_records_its_duration_for_estimates(self):
+        identity = "a" * 24
+        worker.private_directory(self.root / "runs" / identity)
+        self.status(run_id=identity, version="0.15.0", started_at=int(time.time()) - 1200)
+        with patch.object(worker.shutil, "which", return_value="/fake/tool"), \
+             patch.object(worker.shutil, "disk_usage", return_value=SimpleNamespace(free=2**40)), \
+             patch.object(worker, "runtime", return_value="/fake/docker"), \
+             patch.object(worker, "require_image"), patch.object(worker, "prepare_source"), \
+             patch.object(worker, "integrate"), patch.object(worker, "build_candidate"), \
+             patch.object(worker.signal, "alarm"), patch.object(worker.sys, "stdout", io.StringIO()):
+            worker.worker(self.root, identity)
+        state = worker.snapshot(self.root)
+        self.assertEqual(state["phase"], "ready")
+        self.assertGreaterEqual(state["last_duration_s"], 1200)
+        self.assertLess(state["last_duration_s"], 1300)
+
     def test_build_timeout_does_not_start_an_agent_or_install(self):
         identity = "f" * 24
         worker.private_directory(self.root / "runs" / identity)
