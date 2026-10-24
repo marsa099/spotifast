@@ -213,6 +213,17 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+fn fork_note(ui: &mut egui::Ui, palette: &theme::Palette, text: &str) {
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .font(theme::regular(14.0))
+                .color(palette.secondary),
+        )
+        .wrap(),
+    );
+}
+
 fn show_fork_progress(app: &mut App, ui: &mut egui::Ui, release_url: &str) {
     let client = app.fork_update.as_ref().expect("managed fork updater");
     let status = client.status.clone();
@@ -258,6 +269,33 @@ fn show_fork_progress(app: &mut App, ui: &mut egui::Ui, release_url: &str) {
             .wrap(),
         );
     } else if status.phase == "failed" || status.phase == "idle" {
+        let estimate = match status.last_minutes() {
+            Some(minutes) => gettext(locale, "The last update took about {minutes} minutes.")
+                .replace("{minutes}", &minutes.to_string()),
+            None => gettext(
+                locale,
+                "The first update takes about 30–60 minutes, including a one-time setup. Later updates usually take 15–25 minutes.",
+            )
+            .into_owned(),
+        };
+        fork_note(
+            ui,
+            &palette,
+            &format!(
+                "{} {}",
+                gettext(
+                    locale,
+                    "Updating rebuilds and tests Spotifast Lab on this computer. It uses up to 8 CPU cores and 8 GB of memory, so the computer may run warm and slow.",
+                ),
+                estimate
+            ),
+        );
+        ui.add_space(6.0);
+        fork_note(
+            ui,
+            &palette,
+            &gettext(locale, "You can keep listening while it runs."),
+        );
         action = Some((
             gettext(
                 locale,
@@ -279,6 +317,38 @@ fn show_fork_progress(app: &mut App, ui: &mut egui::Ui, release_url: &str) {
                 palette.text,
             );
         });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let progress = match (status.elapsed_minutes(now), status.remaining_minutes(now)) {
+            (Some(elapsed), Some(0)) => Some(
+                gettext(locale, "Running for {elapsed} min, longer than last time.")
+                    .replace("{elapsed}", &elapsed.to_string()),
+            ),
+            (Some(elapsed), Some(left)) => Some(
+                gettext(locale, "Running for {elapsed} min, about {left} min left.")
+                    .replace("{elapsed}", &elapsed.to_string())
+                    .replace("{left}", &left.to_string()),
+            ),
+            (Some(elapsed), None) => Some(
+                gettext(locale, "Running for {elapsed} min.")
+                    .replace("{elapsed}", &elapsed.to_string()),
+            ),
+            (None, _) => None,
+        };
+        ui.add_space(6.0);
+        if let Some(progress) = progress {
+            fork_note(ui, &palette, &progress);
+        }
+        fork_note(
+            ui,
+            &palette,
+            &gettext(locale, "You can keep listening while it runs."),
+        );
+        // Minutes tick without status changes.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(30));
     }
     if !status.message.is_empty() {
         ui.add_space(8.0);

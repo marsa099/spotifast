@@ -220,7 +220,8 @@ def start(root: Path, version: str, data: Path) -> dict:
         session = "spotifast-update-" + identity
         value = publish(root, phase="starting", message="Starting compatibility checks…",
                         version=version, session=session, run_id=identity,
-                        data_dir=str(data.expanduser().absolute()), pid=0)
+                        data_dir=str(data.expanduser().absolute()), pid=0,
+                        started_at=int(time.time()))
         arguments = [str(Path(sys.executable).resolve()), str(tools / "worker.py"), "worker",
                      "--state-dir", str(root), "--run-id", identity]
         try:
@@ -543,7 +544,11 @@ def worker(root: Path, run_id: str) -> None:
                     git(["add", "--all"], cwd=source)
                     if git(["diff", "--cached", "--quiet"], cwd=source, check=False).returncode:
                         git(["commit", "-m", "Repair local fork compatibility"], cwd=source)
-            publish(root, phase="ready", message="Compatibility checks passed. Ready to install when you choose.")
+            # Kept across runs so the app can estimate the next update.
+            started = snapshot(root).get("started_at", 0)
+            elapsed = int(time.time()) - started if started else 0
+            publish(root, phase="ready", message="Compatibility checks passed. Ready to install when you choose.",
+                    **({"last_duration_s": elapsed} if 0 < elapsed < 24 * 3600 else {}))
             print("\nREADY: close this terminal or detach. Installation waits for the app's Restart to update button.", flush=True)
         except BaseException as error:
             publish(root, phase="failed", message=str(error)[:4000])
